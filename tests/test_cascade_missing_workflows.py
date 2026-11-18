@@ -361,11 +361,12 @@ class InflowForecastObservationTest(unittest.TestCase):
             env = episode_environment(self.data, dict(self.physical, use_daily_level_limits=daily_limits), [1965], days=4)
             state, observed = env.state(), env.actor_observations()
             expected = ((np.asarray(self.by_date['1965-01-01'])-self.data.flow_mean)/self.data.flow_std).astype(np.float32)
-            np.testing.assert_array_equal(observed[:, -1], expected)
-            np.testing.assert_array_equal(state[-5:], expected)
-            self.assertEqual(observed.shape, (5, 16 if daily_limits else 12))
-            self.assertEqual(state.shape, (43 if daily_limits else 23,))
-            self.assertEqual(env.observation_features[-1], 'next7d_mean_inflow_forecast_standardized')
+            np.testing.assert_array_equal(observed[:, 2], expected)
+            np.testing.assert_array_equal(state[2::22], expected)
+            self.assertEqual(observed.shape, (5, 22))
+            self.assertEqual(state.shape, (110,))
+            self.assertEqual(env.observation_features[2],
+                             'next7d_mean_incremental_inflow_forecast_standardized')
             self.assertEqual(env.observation_metadata()['end_storage_policy'], 'unconstrained_within_daily_operating_bounds')
 
     def test_episode_forecasts_keep_source_dates_at_leaps_joins_and_dataset_end(self):
@@ -393,17 +394,21 @@ class InflowForecastObservationTest(unittest.TestCase):
         changed.inflow_forecast = self.data.inflow_forecast+10000.*np.arange(1., 6.)
         original = episode_environment(self.data, self.physical, [1965], days=4)
         altered = episode_environment(changed, self.physical, [1965], days=4)
-        np.testing.assert_array_equal(original.state()[:-5], altered.state()[:-5])
         expected_delta = (10000.*np.arange(1., 6.)/self.data.flow_std).astype(np.float32)
-        np.testing.assert_allclose(altered.state()[-5:]-original.state()[-5:], expected_delta, rtol=1e-6, atol=1e-6)
-        np.testing.assert_array_equal(original.actor_observations()[:, :-1], altered.actor_observations()[:, :-1])
+        local_slots = np.arange(5)*22+2
+        upstream_slots = np.arange(1, 5)*22+16
+        np.testing.assert_allclose(altered.state()[local_slots]-original.state()[local_slots],
+                                   expected_delta, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(
+            altered.state()[upstream_slots]-original.state()[upstream_slots],
+            expected_delta[:-1], rtol=1e-5, atol=1e-5)
         for commands in (np.zeros(5), np.full(5, 99), np.array([3, 11, 45, 70, 90]), np.full(5, 48)):
             original.step(commands)
             altered.step(commands)
             for field in ('external', 'release', 'storage_end', 'controls'):
                 np.testing.assert_array_equal(original.last_transition[field], altered.last_transition[field])
-        np.testing.assert_array_equal(original.actor_observations(), np.zeros((5, 16), dtype=np.float32))
-        np.testing.assert_array_equal(original.state(), np.zeros(43, dtype=np.float32))
+        np.testing.assert_array_equal(original.actor_observations(), np.zeros((5, 22), dtype=np.float32))
+        np.testing.assert_array_equal(original.state(), np.zeros(110, dtype=np.float32))
 
     def test_happo_networks_and_rollout_buffers_accept_issued_forecasts(self):
         args = copy.deepcopy(self.args)
@@ -416,13 +421,13 @@ class InflowForecastObservationTest(unittest.TestCase):
         obs = runner.envs[0].actor_observations()
         for i, actor in enumerate(runner.actor):
             first_linear = next(layer for layer in actor.actor.modules() if isinstance(layer, torch.nn.Linear))
-            self.assertEqual(first_linear.in_features, 16)
-            self.assertEqual(runner.actor_buffer[i].obs.shape, (5, 1, 16))
+            self.assertEqual(first_linear.in_features, 22)
+            self.assertEqual(runner.actor_buffer[i].obs.shape, (5, 1, 22))
             action = actor.act(obs[i:i+1], deterministic=True)
             self.assertEqual(tuple(action.shape), (1, 1))
         first_critic = next(layer for layer in runner.critic.critic.modules() if isinstance(layer, torch.nn.Linear))
-        self.assertEqual(first_critic.in_features, 43)
-        self.assertEqual(runner.critic_buffer.share_obs.shape, (5, 1, 43))
+        self.assertEqual(first_critic.in_features, 110)
+        self.assertEqual(runner.critic_buffer.share_obs.shape, (5, 1, 110))
 
 
 class MissingWorkflowIntegrationTest(unittest.TestCase):

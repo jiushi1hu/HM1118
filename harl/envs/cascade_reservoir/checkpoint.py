@@ -29,7 +29,7 @@ from harl.models.value_function_models.v_net import VNet
 
 ROOT = Path(__file__).resolve().parents[3]
 CHECKPOINT_FORMAT = 'cascade_reservoir_inference'
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 REPLAY_TRACE_FIELDS = (
     'phase', 'seed', 'policy_update', 'episode_step', 'date', 'reservoir',
     'policy_action_index', 'command_action_index', 'effective_action_index',
@@ -132,6 +132,8 @@ def _critic_layout(metadata):
         raise ValueError('Checkpoint actor value channels must identify five integer heads')
     if layout == 'shared_team':
         expected_dimension, expected_channels, algorithm = 1, (0,)*len(IDS), 'happo'
+    elif layout == 'mixed_by_reservoir':
+        expected_dimension, expected_channels, algorithm = len(IDS), tuple(range(len(IDS))), 'happo'
     elif layout == 'mixed_by_reservoir_then_legacy_team':
         expected_dimension, expected_channels, algorithm = len(IDS)+1, tuple(range(len(IDS))), 'mappo'
     else:
@@ -200,9 +202,14 @@ def save_checkpoint(runner, path):
     if shared_actor:
         metadata.update(actor_parameter_sharing=True, agent_ids=list(range(len(IDS))),
                         actor_observation_dim=actor_dim, raw_actor_observation_dim=raw_dim)
-    if getattr(runner, 'credit_assignment', 'team_gae') == 'counterfactual':
-        metadata.update(happo_credit_assignment='counterfactual',
-                        actor_advantage_estimator='one_step_counterfactual')
+    credit_assignment = getattr(runner, 'credit_assignment', 'team_gae')
+    if getattr(runner, 'algorithm_name', 'happo') == 'happo':
+        metadata['happo_credit_assignment'] = credit_assignment
+        metadata['actor_advantage_estimator'] = {
+            'team_gae': 'shared_team_gae',
+            'mixed_gae': 'per_reservoir_mixed_gae',
+            'counterfactual': 'one_step_counterfactual',
+        }[credit_assignment]
     payload = dict(format=CHECKPOINT_FORMAT, version=CHECKPOINT_VERSION,
         metadata=metadata, metadata_sha256=_digest(metadata), actors=actor_states,
         critic=critic_state, value_normalizer=normalizer_state)
@@ -276,12 +283,19 @@ def load_checkpoint(path, data_root=None):
             raise ValueError('Checkpoint actor parameter sharing must be a boolean')
         args = settings['algorithm']
         credit_mode = args['algo'].get('happo_credit_assignment','team_gae')
-        if credit_mode not in ('team_gae','counterfactual'):
+        if credit_mode not in ('team_gae','mixed_gae','counterfactual'):
             raise ValueError('Checkpoint has unsupported actor credit assignment')
-        if (metadata.get('happo_credit_assignment','team_gae') != credit_mode or
-                (credit_mode == 'counterfactual' and (metadata.get('algorithm_name') != 'happo' or
-                 metadata.get('actor_advantage_estimator') != 'one_step_counterfactual'))):
+        if metadata.get('happo_credit_assignment','team_gae') != credit_mode:
             raise ValueError('Checkpoint actor credit metadata disagrees with its settings')
+        if credit_mode == 'counterfactual' and (
+                metadata.get('algorithm_name') != 'happo' or
+                metadata.get('actor_advantage_estimator') != 'one_step_counterfactual'):
+            raise ValueError('Checkpoint counterfactual metadata is incomplete')
+        if credit_mode == 'mixed_gae' and (
+                metadata.get('algorithm_name') != 'happo' or
+                metadata.get('critic_reward_layout') != 'mixed_by_reservoir' or
+                metadata.get('actor_advantage_estimator') != 'per_reservoir_mixed_gae'):
+            raise ValueError('Checkpoint mixed_gae metadata is incomplete')
         configured_sharing = args['algo'].get('share_param', False)
         if not isinstance(configured_sharing, bool) or configured_sharing != shared_actor:
             raise ValueError('Checkpoint actor-sharing architecture disagrees with its settings')
@@ -455,7 +469,9 @@ class FrozenCascadePolicy:
             spill_by += transition['spill']*env.physics.dt
             residual = max(residual, float(np.abs(transition['residual']).max()))
             team = self.critic_reward_layout == 'shared_team'
+            mixed = self.critic_reward_layout == 'mixed_by_reservoir'
             rewards.append(np.asarray([transition['system_reward']]) if team else
+                           np.asarray(transition['mixed_rewards']).copy() if mixed else
                            np.r_[transition['mixed_rewards'], transition['reward']])
             value_history.append(values)
             next_value_history.append(next_values)
@@ -494,7 +510,8 @@ class FrozenCascadePolicy:
                     next_shared_team_value=float(next_values[0]) if team else None,
                     shared_team_td_residual=td if team else None,
                     realized_shared_team_reward_to_go=0.,
-                    legacy_team_value=None if team else float(values[-1]), realized_mixed_reward_to_go=0.,
+                    legacy_team_value=(None if team or mixed else float(values[-1])),
+                    realized_mixed_reward_to_go=0.,
                     realized_legacy_team_reward_to_go=0.,
                     ecological_flow_shortfall_m3s=None if shortfalls is None else float(shortfalls['ecological_flow'][i]),
                     ecological_flow_deficit_m3=None if integrals is None else float(integrals['ecological_flow'][i]))
@@ -545,8 +562,9 @@ class FrozenCascadePolicy:
             totals['actor_reward_definition'] = SYSTEM_REWARD_DEFINITION
         totals['advantage_source'] = 'shared_team' if team else 'individual_mixed'
         totals['advantage_normalization'] = ('once_over_common_rollout_rows' if team else
-            'per_reservoir_over_common_rollout_rows' if self.metadata['settings']['algorithm']['algo'].get(
-                'normalize_shared_advantages', False) else 'per_reservoir_over_controllable_rows')
+            'per_reservoir_over_common_rollout_rows' if (self.critic_reward_layout == 'mixed_by_reservoir' or
+                self.metadata['settings']['algorithm']['algo'].get(
+                    'normalize_shared_advantages', False)) else 'per_reservoir_over_controllable_rows')
         return dict(status='ok', phase=phase, seed=self.metadata['seed'],
             policy_update=self.metadata['policy_update'], policy_episode=self.metadata['policy_episode'],
             training_steps=self.metadata['training_steps'], source_years=used_years,

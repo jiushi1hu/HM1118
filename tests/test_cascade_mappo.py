@@ -595,13 +595,13 @@ class CascadeMAPPOIntegrationTest(unittest.TestCase):
             self.assertIs(ma.shared_core, mappo.actor[0].shared_core)
             self.assertEqual(ma.obs_space.shape, happo.actor[0].obs_space.shape)
             self.assertEqual(ma.core.obs_space.shape[0], ma.obs_space.shape[0]+5)
-            self.assertEqual(ma.obs_space.shape, (16,))
-            self.assertEqual(ma.core.obs_space.shape, (21,))
-        self.assertTrue(all(buffer.obs.shape[-1] == 16 for buffer in mappo.actor_buffer))
+            self.assertEqual(ma.obs_space.shape, (22,))
+            self.assertEqual(ma.core.obs_space.shape, (27,))
+        self.assertTrue(all(buffer.obs.shape[-1] == 22 for buffer in mappo.actor_buffer))
         first_critic = next(layer for layer in mappo.critic.critic.modules()
                             if isinstance(layer, torch.nn.Linear))
-        self.assertEqual(first_critic.in_features, 43)
-        self.assertEqual(mappo.critic_buffer.share_obs.shape[-1], 43)
+        self.assertEqual(first_critic.in_features, 110)
+        self.assertEqual(mappo.critic_buffer.share_obs.shape[-1], 110)
         for name, value in mappo.actor[0].actor.state_dict().items():
             self.assertTrue(torch.equal(value, repeat.actor[0].actor.state_dict()[name]))
         for name, value in mappo.critic.critic.state_dict().items():

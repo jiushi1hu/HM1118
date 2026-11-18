@@ -245,7 +245,7 @@ class CounterfactualCreditWorkflowTest(unittest.TestCase):
                     checkpoint_dir=Path(directory))
                 self.addCleanup(runner.close)
                 runner.run(2)
-                actor_size, state_size = (16, 43) if limits else (12, 23)
+                actor_size, state_size = 22, 110
                 self.assertEqual(runner.actor_buffer[0].obs.shape, (4, 2, actor_size))
                 self.assertEqual(runner.critic_buffer.share_obs.shape, (4, 2, state_size))
                 self.assertTrue(np.isfinite(runner.counterfactual_advantages).all())
@@ -257,7 +257,8 @@ class CounterfactualCreditWorkflowTest(unittest.TestCase):
                     for lane in range(runner.n_envs):
                         index = source_dates[runner.counterfactual_context['dates'][t, lane]]
                         expected = ((data.inflow_forecast[index]-data.flow_mean)/data.flow_std).astype(np.float32)
-                        np.testing.assert_array_equal(runner.critic_buffer.share_obs[t, lane, -5:], expected)
+                        np.testing.assert_array_equal(
+                            runner.critic_buffer.share_obs[t, lane, 2::22], expected)
                 self.assertTrue(any(buffer.active_masks[-2].any() for buffer in runner.actor_buffer))
                 policy = load_checkpoint(Path(directory)/'update_000001.pt')
                 self.assertEqual(policy.metadata['observation']['actor_observation_size'], actor_size)

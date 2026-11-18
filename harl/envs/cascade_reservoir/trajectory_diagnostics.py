@@ -229,7 +229,7 @@ class TrajectoryDiagnosticsWriter:
         cb = runner.critic_buffer
         shape = cb.rewards.shape
         days, lanes, channels = shape
-        if (channels not in (1, len(IDS)+1) or days != len(self._transitions) or
+        if (channels not in (1, len(IDS), len(IDS)+1) or days != len(self._transitions) or
                 lanes != len(self._batch['episode_ids']) or len(runner.actor_buffer) != len(IDS) or
                 len(runner.actor) != len(IDS)):
             raise ValueError('Trajectory captures must match a complete five-reservoir rollout')
@@ -245,7 +245,8 @@ class TrajectoryDiagnosticsWriter:
         if not 0. <= gamma <= 1.:
             raise ValueError('gamma must be between zero and one')
         raw = frozen['gae_targets']-frozen['prediction']
-        shared = spec['shared_team'] or runner.algo_args['algo'].get('normalize_shared_advantages', False)
+        shared = (spec['shared_team'] or spec['layout'] == 'mixed_by_reservoir' or
+                  runner.algo_args['algo'].get('normalize_shared_advantages', False))
         common = ((raw-raw.mean(axis=(0, 1), keepdims=True))/
                   (raw.std(axis=(0, 1), keepdims=True)+1e-5) if shared else None)
         if len(before['distributions']) != len(IDS):

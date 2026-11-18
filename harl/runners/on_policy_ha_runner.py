@@ -54,12 +54,18 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
                 self.critic_buffer.returns[:-1] - self.critic_buffer.value_preds[:-1]
             )
 
-        if advantages.shape[-1] != 1:
-            raise ValueError('HAPPO requires one shared-team return and value channel')
+        mode = getattr(self, 'credit_assignment', 'team_gae')
+        counterfactual = mode == 'counterfactual'
+        mixed = mode == 'mixed_gae'
+        if counterfactual or not mixed:
+            if advantages.shape[-1] != 1:
+                raise ValueError('team_gae and counterfactual HAPPO require one shared-team value channel')
+        elif advantages.shape[-1] != self.num_agents:
+            raise ValueError('mixed_gae HAPPO requires one mixed-return value channel per reservoir')
 
-        # Every actor receives the same team advantage. Normalize once over
-        # common rollout rows, before actor-specific masks or sequential F.
-        counterfactual = getattr(self, 'credit_assignment', 'team_gae') == 'counterfactual'
+        # team_gae normalizes one common team signal; mixed_gae normalizes each
+        # reservoir channel over the same rollout rows. Counterfactual credit is
+        # already frozen and normalized by its estimator.
         if counterfactual:
             credits = getattr(self, 'counterfactual_advantages', None)
             expected = advantages.shape[:2]+(self.num_agents,)
@@ -124,11 +130,13 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
             train_options = {'advantages_normalized': True}
             if getattr(self, 'diagnostics_enabled', False):
                 train_options['diagnostics'] = True
+            actor_advantages = (credits[...,agent_id:agent_id+1] if counterfactual else
+                                advantages[...,agent_id:agent_id+1] if mixed else advantages)
             # Only the sequential likelihood factor and each actor's control
-            # mask differ; the frozen normalized team advantage stays shared.
+            # mask differ; the frozen normalized advantage is consumed unchanged.
             actor_train_info = self.actor[agent_id].train(
                 self.actor_buffer[agent_id],
-                (credits[...,agent_id:agent_id+1] if counterfactual else advantages).copy(), "EP",
+                actor_advantages.copy(), "EP",
                 **train_options
             )
 

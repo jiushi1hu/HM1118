@@ -12,6 +12,11 @@ def critic_reward_spec(runner, channels):
         mapping = (0,)*agents
         sources, bases = ('system_reward',)*agents, ('shared_team_return',)*agents
         fitted_basis, legacy_available = 'system_reward', False
+    elif layout == 'mixed_by_reservoir' and channels == agents:
+        mapping = tuple(range(agents))
+        sources = tuple('mixed_rewards[{}]'.format(i) for i in range(agents))
+        bases = ('own_mixed_return',)*agents
+        fitted_basis, legacy_available = 'mixed_reward', False
     elif layout == 'mixed_by_reservoir_then_legacy_team' and channels == agents+1:
         mapping = tuple(range(agents))
         sources = tuple('mixed_rewards[{}]'.format(i) for i in range(agents))
@@ -26,7 +31,8 @@ def critic_reward_spec(runner, channels):
     if tuple(getattr(runner, 'actor_value_channels', mapping)) != mapping:
         raise ValueError('Actor value channels disagree with the critic reward layout')
     return dict(layout=layout, shared_team=layout == 'shared_team', actor_channels=mapping,
-        actor_reward_sources=sources, actor_value_bases=bases, fit_channel=channels-1,
+        actor_reward_sources=sources, actor_value_bases=bases,
+        fit_channel=(0 if layout == 'mixed_by_reservoir' else channels-1),
         fitted_reward_basis=fitted_basis, legacy_value_available=legacy_available)
 
 
@@ -68,7 +74,7 @@ def learning_signal_report(runner, before, post_prediction):
     cb = runner.critic_buffer
     shape = cb.rewards.shape
     if (len(shape) != 3 or shape[0] < 1 or shape[1] < 1 or
-            shape[2] not in (1, runner.num_agents+1)):
+            shape[2] not in (1, runner.num_agents, runner.num_agents+1)):
         raise ValueError('Learning-signal diagnostics require complete cascade trajectories')
     spec = critic_reward_spec(runner, shape[2])
     signals = (before['mc'], before['prediction'], before['gae_targets'], post_prediction)
@@ -100,7 +106,8 @@ def learning_signal_report(runner, before, post_prediction):
     # Match the actual float32 training arithmetic before making float64 summaries.
     raw_advantage = targets-old_prediction
     mc_advantage = mc-old_prediction
-    shared = spec['shared_team'] or runner.algo_args['algo'].get('normalize_shared_advantages', False)
+    shared = (spec['shared_team'] or spec['layout'] == 'mixed_by_reservoir' or
+              runner.algo_args['algo'].get('normalize_shared_advantages', False))
     normalized_advantage = ((raw_advantage-raw_advantage.mean(axis=(0, 1), keepdims=True))/
                             (raw_advantage.std(axis=(0, 1), keepdims=True)+1e-5)
                             if shared else None)
@@ -174,7 +181,8 @@ def learning_signal_report(runner, before, post_prediction):
         entry = dict(window_start_year=int(window), source_years=list(source_years[lane]),
             episode_days=int(end-start), critic_fitted_reward_basis=spec['fitted_reward_basis'],
             realized_fitted_return_reward_units=float(mc[start, lane, spec['fit_channel']]),
-            gae_start_target=float(targets[start, lane, -1]), pre_value_start=float(old_prediction[start, lane, -1]),
+            gae_start_target=float(targets[start, lane, spec['fit_channel']]),
+            pre_value_start=float(old_prediction[start, lane, spec['fit_channel']]),
             critic_mc_pre=_fit(mc[rows], old_prediction[rows]),
             critic_mc_post=_fit(mc[rows], post_prediction[rows]),
             gae_target_vs_mc=_fit(mc[rows], targets[rows]),
@@ -197,7 +205,7 @@ def learning_signal_report(runner, before, post_prediction):
             window_diversity_effective_count=float(1./np.square(frequencies).sum()),
             diversity_definition='inverse concentration of sampled-window frequencies; not statistical sample size',
             episode_lengths=lengths, trajectory_return_statistics=signal_statistics(
-                [mc[start, lane, -1] for lane, start in enumerate(starts)])),
+                [mc[start, lane, spec['fit_channel']] for lane, start in enumerate(starts)])),
         critic_output_layout=spec['layout'], critic_fitted_reward_basis=spec['fitted_reward_basis'],
         actor_value_channels=list(spec['actor_channels']),
         legacy_team_value_available=spec['legacy_value_available'],

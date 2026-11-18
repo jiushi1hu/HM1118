@@ -24,6 +24,8 @@ PREVIOUS_ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_next7d_fore
 CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_v3'
 VOLUME_CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_forecasts_targets_future_volumes_v2'
 TARGET_CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_terminal_targets_v1'
+CASCADE_ACTOR_OBSERVATION_LAYOUT = 'cascade_local_upstream_downstream_system_v7'
+CASCADE_CRITIC_STATE_LAYOUT = 'concatenated_five_actor_observations_v1'
 FORECAST_INPUT = 'five_reservoir_next7d_mean_inflow_forecast_1965_2024.csv'
 SHARED_FIELDS = (
     'episode_horizon_days', 'parallel_environments', 'episodes_per_seed',
@@ -139,6 +141,14 @@ def _observation_dimensions(run):
     critic_layout = architecture.get('critic_state_layout')
     state_size = 38 if daily_limits else 18
     raw_dim = 15 if daily_limits else 11
+    if actor_layout == CASCADE_ACTOR_OBSERVATION_LAYOUT:
+        if not has_forecast:
+            raise ValueError('The cascade actor observation layout requires the inflow forecast input hash')
+        if critic_layout != CASCADE_CRITIC_STATE_LAYOUT:
+            raise ValueError('The cascade actor observation layout requires the concatenated critic state layout')
+        if architecture.get('critic_state_size') != 110:
+            raise ValueError('Critic state size does not match its observation layout')
+        return 22, 110
     if actor_layout in (ACTOR_OBSERVATION_LAYOUT, TARGET_ACTOR_OBSERVATION_LAYOUT, VOLUME_ACTOR_OBSERVATION_LAYOUT):
         if not has_forecast:
             raise ValueError('The current actor observation layout requires the inflow forecast input hash')
@@ -181,20 +191,25 @@ def _validate_architecture(algorithm, run):
         counterfactual = (algorithm == 'happo' and
             settings.get('algo', {}).get('happo_credit_assignment','team_gae') == 'counterfactual')
         team = algorithm == 'happo' and objective.get('advantage_source') in ('shared_team','counterfactual_shared_team')
+        mixed_happo = (algorithm == 'happo' and
+                       objective.get('critic_reward_layout') == 'mixed_by_reservoir')
+        objective_layout = ('shared_team' if team else
+            'mixed_by_reservoir' if objective.get('critic_reward_layout') == 'mixed_by_reservoir' else
+            'mixed_by_reservoir_then_legacy_team')
         expected_objective = dict(
             advantage_source='counterfactual_shared_team' if counterfactual else 'shared_team' if team else 'individual_mixed',
             reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
                             if team else '0.5 * own local reward + 0.5 * global generation reward'),
-            critic_reward_layout='shared_team' if team else 'mixed_by_reservoir_then_legacy_team',
+            critic_reward_layout=objective_layout,
             actor_value_channels=[0]*5 if team else list(range(5)),
             normalization=('common_controllable_rms_without_centering' if counterfactual else
                            'once_over_common_rollout_rows' if team
                            else 'per_reservoir_over_common_rollout_rows'
-                           if settings.get('algo', {}).get('normalize_shared_advantages', False)
+                           if mixed_happo or settings.get('algo', {}).get('normalize_shared_advantages', False)
                            else 'per_reservoir_over_controllable_rows'))
         if objective != expected_objective:
             raise ValueError('Learning objective does not match the algorithm reward/value layout')
-        critic_dim = 1 if team else 6
+        critic_dim = 1 if team else 5 if objective.get('critic_reward_layout') == 'mixed_by_reservoir' else 6
     if architecture is None:
         if requested:
             raise ValueError('Shared MAPPO requires explicit actor_architecture metadata')
@@ -236,11 +251,11 @@ def validate_comparison(payload):
         if 'algorithm' in run and str(run['algorithm']).lower() != algorithm:
             raise ValueError('Algorithm label disagrees with its plotting payload')
         context, signature = _context(run)
-        _validate_architecture(algorithm, run)
         observation_dimensions = _observation_dimensions(run)
         if observation_reference is not None and observation_dimensions != observation_reference:
             raise ValueError('Comparison actor/critic observation layouts differ between algorithms')
         observation_reference = observation_dimensions
+        _validate_architecture(algorithm, run)
         identity = _canonical(context)
         if reference is not None and identity != reference:
             raise ValueError('Comparison settings or input data_hashes differ between algorithms')

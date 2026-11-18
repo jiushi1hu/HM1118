@@ -193,10 +193,12 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                        for seed in config['experiment']['seeds']}
     bins=config['model']['action_bins']
     credit_mode=config['algo'].get('happo_credit_assignment','team_gae')
-    if credit_mode not in ('team_gae','counterfactual'):
-        raise ValueError('happo_credit_assignment must be team_gae or counterfactual')
+    if credit_mode not in ('team_gae','mixed_gae','counterfactual'):
+        raise ValueError('happo_credit_assignment must be team_gae, mixed_gae or counterfactual')
     if credit_mode == 'counterfactual' and getattr(runner_cls,'algorithm_name','happo') != 'happo':
         raise ValueError('Counterfactual credit is a HAPPO-only variant')
+    if credit_mode == 'mixed_gae' and getattr(runner_cls,'algorithm_name','happo') != 'happo':
+        raise ValueError('mixed_gae is a HAPPO-only advantage mode')
     trajectory_enabled=config['experiment'].get('trajectory_diagnostics',False)
     checkpoints_enabled=config['experiment'].get('save_checkpoints',False)
     if not isinstance(trajectory_enabled,bool) or not isinstance(checkpoints_enabled,bool):
@@ -241,8 +243,10 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     # Keep every other optimization, physical and budget setting comparable.
     shared_algo.pop('share_param',None)
     sharing=bool(getattr(runner_cls,'share_actor_parameters',False))
-    critic_layout=getattr(runner_cls,'critic_reward_layout','mixed_by_reservoir_then_legacy_team')
+    critic_layout = ('mixed_by_reservoir' if credit_mode == 'mixed_gae' else
+                     getattr(runner_cls,'critic_reward_layout','mixed_by_reservoir_then_legacy_team'))
     team_advantage=critic_layout=='shared_team'
+    mixed_happo = critic_layout=='mixed_by_reservoir'
     learning_objective=dict(
         advantage_source='shared_team' if team_advantage else 'individual_mixed',
         reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
@@ -251,7 +255,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         actor_value_channels=[0]*5 if team_advantage else list(range(5)),
         normalization=('once_over_common_rollout_rows' if team_advantage
                        else 'per_reservoir_over_common_rollout_rows'
-                       if config['algo'].get('normalize_shared_advantages',False)
+                       if mixed_happo or config['algo'].get('normalize_shared_advantages',False)
                        else 'per_reservoir_over_controllable_rows'))
     daily_limits=physical.get('use_daily_level_limits',True)
     raw_observation_dim=len(actor_observation_features(daily_limits))
@@ -259,7 +263,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         optimizer_count=1 if sharing else 5,raw_observation_dim=raw_observation_dim,
         network_observation_dim=raw_observation_dim+(5 if sharing else 0),
         identity_features='one_hot_reservoir_id' if sharing else 'implicit_in_separate_actor',
-        critic_output_dim=1 if team_advantage else 6,
+        critic_output_dim=1 if team_advantage else 5 if mixed_happo else 6,
         actor_observation_layout=ACTOR_OBSERVATION_LAYOUT,
         critic_state_layout=CRITIC_STATE_LAYOUT,
         critic_state_size=critic_state_size(daily_limits))
@@ -277,20 +281,25 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             getattr(runner_cls,'algorithm_name',algorithm_name or 'happo'),
             config['train']['use_valuenorm']),
         learning_reward_architecture=dict(alpha=0.5,
-            actor_reward='0.5 * own local reward + 0.5 * global generation reward',
+            actor_reward=('0.5 * sum(local rewards) + 0.5 * global generation reward'
+                          if team_advantage else '0.5 * own local reward + 0.5 * global generation reward'),
             local_reward='own power / installed capacity - own weighted relative ecological-flow deficit; '
                 'ecological-flow costs are disabled when reward penalties are disabled',
             system_reward='0.5 * sum(local rewards) + 0.5 * global generation reward',
-            critic='one centralized network: five mixed-return outputs plus one legacy-team diagnostic output',
-            actor_advantages='own mixed-return GAE and own value output; normalize each channel independently',
+            critic=('one centralized scalar team-return output' if team_advantage else
+                    'one centralized network: five mixed-return outputs' if mixed_happo else
+                    'one centralized network: five mixed-return outputs plus one legacy-team diagnostic output'),
+            actor_advantages=('shared team GAE, normalized once over common rollout rows' if team_advantage else
+                              'own mixed-return GAE and own value output; normalize each channel over common rollout rows'),
             actor_temporal_weighting='uniform_rollout_rows',
             actor_objective_reduction='mean over all rollout rows; policy active masks zero forced rows',
             actor_discount_scope='gamma remains in GAE, Monte Carlo returns and reward accounting; '
                 'no additional gamma**t multiplier on policy or entropy objectives',
             legacy_metrics='existing reward and compact CSV metrics retain legacy team-reward definitions; '
                 'return plots follow the declared learning objective',
-            update_interpretation='individual-objective sequential clipped surrogates with original likelihood factors; '
-                'the common-return HAPPO improvement guarantee is not asserted for system accounting'),
+            update_interpretation=('shared-team sequential clipped surrogates with original likelihood factors' if team_advantage else
+                'mixed-return sequential HAPPO surrogates with original likelihood factors; '
+                'the common-return HAPPO improvement guarantee is not asserted')),
         episode_horizon_days=days,parallel_environments=count,collector_backend='spawn worker processes',
         episodes_per_seed=episodes,updates_per_seed=episodes//count,
         collector_steps_per_update=days*count,collector_steps_per_seed=days*episodes,
@@ -316,7 +325,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             files={str(seed):str(path.resolve()) for seed,path in trajectory_paths.items()},
             columns=list(TRAJECTORY_DIAGNOSTIC_FIELDS),
             values='frozen before optimization and before ValueNorm statistics change',
-            advantages='own mixed reward channel; exact configured normalization and actor-entry HAPPO factor',
+            advantages=('shared team reward/value channel 0; normalized once over common rollout rows; actor-entry HAPPO factor remains separate'
+                        if team_advantage else
+                        'own mixed reward channel; per-channel common-row normalization and actor-entry HAPPO factor'),
             actor_temporal_weighting='uniform_rollout_rows',
             episode_time_weight='always 1.0; column retained for CSV compatibility',
             policy_objective_weight='policy active mask only; HAPPO likelihood factor is recorded separately',

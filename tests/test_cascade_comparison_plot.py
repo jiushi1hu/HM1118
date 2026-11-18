@@ -218,15 +218,15 @@ class ComparisonIdentityTest(unittest.TestCase):
             context['data_hashes'][compare.FORECAST_INPUT] = 'f'*64
             shared = sharing and entry['algorithm'] == 'mappo'
             context['shared_settings']['algo']['share_param'] = shared
-            raw_dim = 16 if daily_limits else 12
+            raw_dim = 22
             run['actor_architecture'].update(parameter_sharing=shared,
                 network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
                 raw_observation_dim=raw_dim,
                 network_observation_dim=raw_dim+5 if shared else raw_dim,
                 identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor',
-                actor_observation_layout=compare.ACTOR_OBSERVATION_LAYOUT,
-                critic_state_layout=compare.CRITIC_STATE_LAYOUT,
-                critic_state_size=43 if daily_limits else 23)
+                actor_observation_layout=compare.CASCADE_ACTOR_OBSERVATION_LAYOUT,
+                critic_state_layout=compare.CASCADE_CRITIC_STATE_LAYOUT,
+                critic_state_size=110)
         return data
 
     def test_current_versioned_actor_and_critic_layouts_accept_both_limit_modes_and_sharing(self):
@@ -240,8 +240,8 @@ class ComparisonIdentityTest(unittest.TestCase):
                 ('actor_observation_layout', 'unsupported_actor_v99', 'actor observation layout'),
                 ('critic_state_layout', 'unsupported_critic_v99', 'critic state layout'),
                 ('critic_state_size', 38, 'Critic state size'),
-                ('raw_observation_dim', 17, 'dimensions/counts'),
-                ('network_observation_dim', 22, 'dimensions/counts')):
+                ('raw_observation_dim', 23, 'dimensions/counts'),
+                ('network_observation_dim', 28, 'dimensions/counts')):
             with self.subTest(field=field):
                 data = self.versioned_payload()
                 data['runs'][1]['payload']['actor_architecture'][field] = value
@@ -269,9 +269,11 @@ class ComparisonIdentityTest(unittest.TestCase):
                     architecture = entry['payload']['actor_architecture']
                     architecture['actor_observation_layout'] = compare.PREVIOUS_ACTOR_OBSERVATION_LAYOUT
                     architecture.pop('critic_state_layout')
-                    architecture['critic_state_size'] -= 5
-                    architecture['raw_observation_dim'] -= 0
-                    architecture['network_observation_dim'] -= 0
+                    architecture['critic_state_size'] = 38 if daily_limits else 18
+                    architecture['raw_observation_dim'] = 16 if daily_limits else 12
+                    architecture['network_observation_dim'] = (
+                        architecture['raw_observation_dim'] +
+                        (5 if architecture['parameter_sharing'] else 0))
                 compare.validate_comparison(data)
 
     def test_previous_target_layout_retains_its_original_dimensions(self):
@@ -281,9 +283,11 @@ class ComparisonIdentityTest(unittest.TestCase):
                 architecture = entry['payload']['actor_architecture']
                 architecture['actor_observation_layout'] = compare.TARGET_ACTOR_OBSERVATION_LAYOUT
                 architecture['critic_state_layout'] = compare.TARGET_CRITIC_STATE_LAYOUT
-                architecture['critic_state_size'] += 5
-                architecture['raw_observation_dim'] += 1
-                architecture['network_observation_dim'] += 1
+                architecture['critic_state_size'] = 48 if daily_limits else 28
+                architecture['raw_observation_dim'] = 17 if daily_limits else 13
+                architecture['network_observation_dim'] = (
+                    architecture['raw_observation_dim'] +
+                    (5 if architecture['parameter_sharing'] else 0))
             compare.validate_comparison(data)
 
     def test_comparison_rejects_new_and_historical_observation_layouts_on_same_data(self):

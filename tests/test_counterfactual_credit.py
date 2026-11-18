@@ -28,9 +28,8 @@ def value_function(states):
     states = np.asarray(states, dtype=np.float32)
     # Explicit row reductions keep this analytical reference independent of
     # BLAS's batch-size-dependent float32 matrix-multiply accumulation order.
-    return ((states[:, :5]*np.arange(1., 6., dtype=np.float32)).sum(axis=1)+
-            3.*states[:, 10:15].sum(axis=1)+
-            (states[:, :5]*.5*states[:, -5:]).sum(axis=1)).reshape(-1, 1)
+    weights = np.linspace(.25, 1.25, states.shape[1], dtype=np.float32)
+    return (states*weights).sum(axis=1, keepdims=True)
 
 
 class CounterfactualCreditTest(unittest.TestCase):
@@ -44,6 +43,8 @@ class CounterfactualCreditTest(unittest.TestCase):
             config['head_model'] = head
             config['reward_penalties'].update(ecological_flow_weight=.3)
             data = CascadeData(ROOT/'data/cascade_reservoir_new', config, algorithm['experiment'])
+            # Lanes may use different source years. Candidate observations must
+            # resolve dates against the full calendar supplied by the runner.
             envs = [episode_environment(data, config, [year], 3, 5) for year in (1965, 1973)]
             records, snapshots, next_states = [], [], []
             for step in range(3):
@@ -58,15 +59,19 @@ class CounterfactualCreditTest(unittest.TestCase):
                 for key, source in dict(storage_start='storage_start', external='external',
                     actions='sampled_actions', storage_lower='storage_lower_m3',
                     storage_upper='storage_upper_m3', controls='controls').items()}
+            context['dates'] = np.asarray([[row['date'] for row in day] for day in records],
+                                          dtype=object)
             probabilities = np.stack([np.roll(np.arange(1.,6.), i) for i in range(5)])
             probabilities = np.broadcast_to(probabilities/15., (3,2,5,5)).copy()
             masks = np.ones((3,2,1)); masks[-1] = 0.
             cls.fixtures[head] = dict(env=envs[0], records=records, snapshots=snapshots,
                 context=context, next_states=np.asarray(next_states), probabilities=probabilities, masks=masks)
+            cls.fixtures[head]['observation_data'] = data
 
     def compute(self, fixture, *, batch=7, critic=value_function, normalizer=None, gamma=.995, **overrides):
         values = dict(context=fixture['context'], next_states=fixture['next_states'],
-            policy_probabilities=fixture['probabilities'], continuation_masks=fixture['masks'])
+            policy_probabilities=fixture['probabilities'], continuation_masks=fixture['masks'],
+            observation_data=fixture['observation_data'])
         values.update(overrides)
         return compute_counterfactual_credit(fixture['env'].physics, fixture['env'].operation_reward,
             critic, normalizer, gamma=gamma, batch_size=batch, **values)
@@ -93,6 +98,10 @@ class CounterfactualCreditTest(unittest.TestCase):
                                     next_env = copy.copy(fixture['snapshots'][step][lane])
                                     next_env.storage = transition['storage_end'].copy()
                                     next_env.previous_release = transition['release'].copy()
+                                    next_env.previous_requested_action = actions.copy()
+                                    next_env.previous_realized_action = transition['actions'].copy()
+                                    next_env.previous_power = transition['power'].copy()
+                                    next_env.previous_turbine = transition['turbine'].copy()
                                     value = float(normalizer.denormalize(value_function(next_env.state()[None]))[0,0])
                                 expected[step,lane,actor,command] = transition['system_reward']+.995*value
                 np.testing.assert_allclose(result['q_values'], expected, rtol=1e-7, atol=2e-6)
@@ -100,7 +109,10 @@ class CounterfactualCreditTest(unittest.TestCase):
                 selected = np.take_along_axis(expected, fixture['context']['actions'][...,None], axis=-1)[...,0]
                 np.testing.assert_allclose(result['baseline'], baseline, rtol=1e-7, atol=2e-6)
                 np.testing.assert_allclose(result['q_actual'], selected, rtol=1e-7, atol=2e-6)
-                np.testing.assert_allclose(result['raw_advantages'], selected-baseline, rtol=1e-6, atol=2e-6)
+                expected_raw = np.where(fixture['context']['controls'] > 0.,
+                                        selected-baseline, 0.)
+                np.testing.assert_allclose(result['raw_advantages'], expected_raw,
+                                           rtol=1e-6, atol=2e-6)
                 # Every actor-specific selected command reconstructs the same actual joint action.
                 np.testing.assert_allclose(result['q_actual'],
                     np.broadcast_to(result['q_actual'][...,:1], result['q_actual'].shape), rtol=0., atol=1e-9)
@@ -142,30 +154,26 @@ class CounterfactualCreditTest(unittest.TestCase):
         np.testing.assert_array_equal(first['q_values'], terminal['q_values'])
 
     def test_candidate_states_preserve_next_date_issued_forecasts(self):
-        original = self.fixtures['fixed']
-        for width in (23, 43):
-            with self.subTest(state_size=width):
-                fixture = dict(original)
-                states = original['next_states']
-                if width == 23:
-                    states = np.concatenate([states[..., :18], states[..., -5:]], axis=-1)
-                fixture['next_states'] = states
-                batches = []
-                def predict(candidate):
-                    batches.append(candidate.copy())
-                    return value_function(candidate)
-                self.compute(fixture, critic=predict)
-                candidates = np.concatenate(batches)
-                templates = np.repeat(states[:-1].reshape(-1, width), 5*5, axis=0)
-                self.assertEqual(candidates.shape, templates.shape)
-                np.testing.assert_array_equal(candidates[:, 5:10], templates[:, 5:10])
-                np.testing.assert_array_equal(candidates[:, 15:], templates[:, 15:])
-                self.assertTrue(np.any(candidates[:, :5] != templates[:, :5]))
+        fixture = self.fixtures['fixed']
+        states = fixture['next_states']
+        batches = []
+        def predict(candidate):
+            batches.append(candidate.copy())
+            return value_function(candidate)
+        self.compute(fixture, critic=predict)
+        candidates = np.concatenate(batches)
+        templates = np.repeat(states[:-1].reshape(-1, 110), 5*5, axis=0)
+        self.assertEqual(candidates.shape, templates.shape)
+        forecast_slots = np.array([22*i+2 for i in range(5)] +
+                                  [22*i+16 for i in range(1, 5)])
+        np.testing.assert_array_equal(candidates[:, forecast_slots],
+                                      templates[:, forecast_slots])
+        self.assertTrue(np.any(candidates != templates))
 
     def test_legacy_states_without_dispatch_context_are_rejected(self):
         fixture = self.fixtures['fixed']
         for width in (18, 28, 33, 38, 48, 53):
-            with self.subTest(state_size=width), self.assertRaisesRegex(ValueError, '23/43'):
+            with self.subTest(state_size=width), self.assertRaisesRegex(ValueError, '110'):
                 self.compute(fixture, next_states=np.zeros((3, 2, width)))
 
     def test_forced_choices_are_zero_credit_and_keep_original_sampled_commands(self):
@@ -174,8 +182,9 @@ class CounterfactualCreditTest(unittest.TestCase):
         external = env.data.external[0]
         context = dict(storage_start=storage[None,None], external=external[None,None],
             actions=np.array([[[4,3,2,1,0]]]), storage_lower=storage[None,None],
-            storage_upper=storage[None,None], controls=np.zeros((1,1,5)))
-        result = self.compute(fixture, context=context, next_states=np.zeros((1,1,43)),
+            storage_upper=storage[None,None], controls=np.zeros((1,1,5)),
+            dates=np.asarray([[env.data.dates[0]]], dtype=object))
+        result = self.compute(fixture, context=context, next_states=np.zeros((1,1,110)),
             policy_probabilities=np.full((1,1,5,5), .2), continuation_masks=np.zeros((1,1,1)))
         np.testing.assert_array_equal(result['raw_advantages'], np.zeros((1,1,5)))
         np.testing.assert_array_equal(result['normalized_advantages'], np.zeros((1,1,5)))
@@ -207,7 +216,7 @@ class CounterfactualCreditTest(unittest.TestCase):
                 self.assertTrue(row['controls'].any())
                 self.assertGreater(float(np.abs(env.storage-data.initial_storage(1965)).max()), 1.)
                 context = {key:value[-1:, :1].copy() for key, value in fixture['context'].items()}
-                result = self.compute(fixture, context=context, next_states=np.zeros((1, 1, 43)),
+                result = self.compute(fixture, context=context, next_states=np.zeros((1, 1, 110)),
                     policy_probabilities=fixture['probabilities'][-1:, :1],
                     continuation_masks=np.zeros((1, 1, 1)))
                 np.testing.assert_allclose(result['q_actual'], row['system_reward'], rtol=1e-7, atol=2e-6)

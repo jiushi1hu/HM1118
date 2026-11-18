@@ -59,18 +59,29 @@ projection, seasonal refill budget or terminal-deviation reward. Storage is
 always calculated from executed flows. Episode boundaries still stop value
 bootstrapping; this is independent of reservoir inventory requirements.
 
-Actor observations contain local and immediate-neighbor storage, current inflow,
-yesterday's release, downstream headroom, calendar/time features and daily bounds.
-The supplied `five_reservoir_next7d_mean_inflow_forecast_1965_2024.csv` contributes
-one additional local feature: the date-t forecast of next-seven-day mean inflow,
-standardized using actual-inflow statistics from training years only. Forecasts
-are read from the supplied file, including at nonconsecutive held-out year joins;
-they are not recomputed from future actual inflows. Actors receive 16 features
-with daily limits, or 12 without them; the issued forecast is the final feature.
-The centralized critic receives the five issued forecasts after the physical
-state prefix, for 43 features with daily limits or 23 without. Layout versions
-are recorded in logs/checkpoints. Earlier checkpoints require their original
-source snapshot and cannot be loaded into the reduced input layout.
+Actor observations use one fixed 22-feature layout for all five reservoirs. The
+first 14 local features are normalized current water level; actual total inflow
+(external or incremental inflow plus the previous day's executed upstream
+release) divided by release capacity; the supplied issued next-seven-day mean
+incremental inflow forecast, standardized using training-year actual-inflow
+statistics; seasonal sine and cosine; next-day maximum and minimum permitted
+water levels; the previous requested normalized action; current storage ratio;
+remaining regulation-capacity ratio; previous actual total release, turbine
+release and power, each divided by its capacity; and the previous realized action
+after environmental correction. The next three features are the immediate
+upstream reservoir's water level, actual release and issued forecast; WDD uses
+`[0, 0, 0]`. The next two are the immediate downstream reservoir's water level
+and remaining regulation-capacity ratio; THR uses `[0, 1]`. The final three are
+total storage divided by combined normal storage, total realized power divided by
+total installed capacity, and a flood-season indicator equal to 1 from June 1
+through September 30 and 0 otherwise.
+
+Forecasts are read from the supplied file, including at nonconsecutive held-out
+year joins; they are not recomputed from future actual inflows. The centralized
+critic receives the five observations concatenated in WDD/BHT/XLD/XJB/THR order,
+for 110 input features. Checkpoints record the observation and critic layouts;
+version 2 checkpoints use this contract, and earlier checkpoints cannot be loaded
+because their observation dimensions and source hashes differ.
 
 For categorical action k among K commands:
 
@@ -124,14 +135,18 @@ process-parallel episodes per update, 1,825 daily transitions per episode,
 The default therefore performs 50 updates per seed. Leap days remain in the data;
 the fixed horizon need not end on December 31.
 
-HAPPO uses five independent actors and one scalar centralized team critic.
-All actors receive one team GAE advantage, normalized once across rollout rows.
-Actors update sequentially with accumulated likelihood corrections for previously
-updated actors. PPO clips the current actor ratio. Control masks zero forced
-rows, and losses retain a mean over the entire rollout.
+HAPPO uses five independent actors and one centralized critic. The default
+`team_gae` mode trains on `system_reward` with one value output; all actors share
+one team GAE advantage, normalized once across rollout rows. The `mixed_gae` mode
+trains on each reservoir's `mixed_rewards[i]` with five critic value outputs and
+five independently computed GAE channels; each actor receives only its own
+channel. Both modes update actors sequentially with accumulated likelihood
+corrections for previously updated actors and PPO clipping of the current actor
+ratio. Control masks zero forced rows, and losses retain a mean over the entire
+rollout.
 
 MAPPO uses one shared actor and optimizer. Five lightweight views append a
-five-way one-hot reservoir identity, giving 22 actor inputs with daily limits.
+five-way one-hot reservoir identity, giving 27 actor network inputs.
 Own mixed-return advantages are pooled in one joint training batch. One
 centralized critic produces five mixed-return values plus a legacy accounting
 value. MAPPO uses unit factors and no sequential likelihood correction. Its
@@ -144,6 +159,7 @@ actor advantages use rollout ValueNorm statistics. The normalizer updates once
 from full-rollout critic targets after actor training and stays fixed through
 critic epochs. Training uses CPU execution.
 
+`--happo-credit-assignment mixed_gae` selects the five-channel mixed-return mode.
 `--happo-credit-assignment counterfactual` optionally replaces HAPPO actor GAE
 with frozen one-step, model-assisted counterfactual credit. It enumerates commands
 under the same full physical constraints and ecological reward, holding other

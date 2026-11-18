@@ -17,6 +17,7 @@ from harl.envs.cascade_reservoir.evaluation import evaluate_policy, episode_cons
 from harl.envs.cascade_reservoir.periodic_evaluation import (
     evaluate_periodic_policy, select_periodic_windows)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
+from harl.envs.cascade_reservoir.counterfactual_credit import validate_credit_assignment
 from harl.envs.cascade_reservoir.reward import (
     ACTOR_REWARD_DEFINITION, SYSTEM_REWARD_DEFINITION, EpisodeRewardMetrics,
     reward_settings, validate_discount_factor)
@@ -45,12 +46,6 @@ def validate_seed(value):
             not isinstance(value, (int, np.integer)) or not 0 <= value <= 2**32-1):
         raise ValueError(message)
     return int(value)
-
-
-def validate_credit_assignment(value):
-    if value not in ('team_gae', 'counterfactual'):
-        raise ValueError('happo_credit_assignment must be team_gae or counterfactual')
-    return value
 
 
 def value_normalization_update_schedule(algorithm_name, use_valuenorm):
@@ -88,6 +83,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                                          'counterfactual_batch_size')
         if self.credit_assignment == 'counterfactual' and self.algorithm_name != 'happo':
             raise ValueError('Counterfactual credit is an opt-in HAPPO variant; MAPPO requires team_gae')
+        if self.credit_assignment == 'mixed_gae' and self.algorithm_name != 'happo':
+            raise ValueError('mixed_gae is a HAPPO-only advantage mode')
         self.counterfactual_credit = self.counterfactual_advantages = None
         self.counterfactual_context = self.counterfactual_probabilities = None
         self.counterfactual_log = counterfactual_log
@@ -137,11 +134,17 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         torch.use_deterministic_algorithms(True)
         self.reward_settings = reward_settings(physical_config)
-        # HAPPO uses one team-return value. The MAPPO subclass retains its
-        # five mixed-return values and legacy accounting-value output.
+        # HAPPO team_gae uses one team-return value. HAPPO mixed_gae uses five
+        # reservoir-specific mixed-return values; MAPPO retains its six heads.
+        if self.credit_assignment == 'mixed_gae':
+            self.critic_reward_layout = 'mixed_by_reservoir'
+            self.actor_value_channels = tuple(range(self.num_agents))
         if self.critic_reward_layout == 'shared_team':
             self.critic_output_dim = 1
             expected_channels = (0,) * self.num_agents
+        elif self.critic_reward_layout == 'mixed_by_reservoir':
+            self.critic_output_dim = self.num_agents
+            expected_channels = tuple(range(self.num_agents))
         elif self.critic_reward_layout == 'mixed_by_reservoir_then_legacy_team':
             self.critic_output_dim = self.num_agents + 1
             expected_channels = tuple(range(self.num_agents))
@@ -225,6 +228,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             # system_reward counts the global component once, unlike summing
             # the five individual mixed rewards.
             return np.asarray([[row['system_reward']] for row in transitions], dtype=np.float32)
+        if self.critic_reward_layout == 'mixed_by_reservoir':
+            return np.asarray([row['mixed_rewards'] for row in transitions], dtype=np.float32)
         return np.asarray([np.r_[row['mixed_rewards'], row['reward']]
                            for row in transitions], dtype=np.float32)
 
@@ -232,6 +237,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         """Describe the actual policy target alongside preserved accounting fields."""
         team = self.critic_reward_layout == 'shared_team'
         common_rows = self.algo_args['algo'].get('normalize_shared_advantages', False)
+        happo_mixed = (self.algorithm_name == 'happo' and
+                       self.critic_reward_layout == 'mixed_by_reservoir')
         metadata = dict(algorithm=self.algorithm_name,
             critic_reward_layout=self.critic_reward_layout,
             actor_value_channels=list(self.actor_value_channels),
@@ -240,10 +247,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                   ['mixed_rewards[{}]'.format(i) for i in self.actor_value_channels]),
             advantage_estimator='gae' if self.algo_args['algo'].get('use_gae', True) else 'discounted_return',
             advantage_normalization=('once_over_common_rollout_rows' if team else
-                'per_reservoir_over_common_rollout_rows' if common_rows else
+                'per_reservoir_over_common_rollout_rows' if happo_mixed or common_rows else
                 'per_reservoir_over_controllable_rows'),
             actor_reward_definition=SYSTEM_REWARD_DEFINITION if team else ACTOR_REWARD_DEFINITION,
             mixed_reward_definition=ACTOR_REWARD_DEFINITION)
+        if not team and self.critic_reward_layout == 'mixed_by_reservoir':
+            metadata['actor_advantages'] = 'own mixed-return GAE per reservoir; one value output per channel'
         if getattr(self, 'credit_assignment', 'team_gae') == 'counterfactual':
             metadata.update(happo_credit_assignment='counterfactual',
                 advantage_source='counterfactual_shared_team',
@@ -430,14 +439,25 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         predictions = cb.value_preds[:-1]
         if self.value_normalizer is not None:
             predictions = self.value_normalizer.denormalize(predictions)
-        # The last value is HAPPO's scalar team return, or MAPPO's retained
-        # legacy accounting return. Generic fit fields follow that layout.
-        predictions = predictions[..., -1:]
-        targets = cb.returns[:-1, :, -1:]
+        if self.critic_reward_layout == 'shared_team':
+            selected = slice(0, 1)
+        elif self.critic_reward_layout == 'mixed_by_reservoir':
+            selected = slice(0, self.num_agents)
+        else:
+            # MAPPO's retained last channel is the legacy accounting return.
+            selected = slice(-1, None)
+        predictions = predictions[..., selected]
+        targets = cb.returns[:-1, :, selected]
         self.last_rollout.update(gae_target_mean=float(targets.mean()),
             value_prediction_mean=float(predictions.mean()),
             gae_target_rmse=float(np.sqrt(np.mean((targets-predictions)**2))),
             gae_target_explained_variance=float(1.-np.var(targets-predictions)/max(float(np.var(targets)),1e-8)))
+        if self.critic_reward_layout == 'mixed_by_reservoir':
+            self.last_rollout.update(
+                gae_target_mean_by_reservoir=targets.mean(axis=(0, 1)).tolist(),
+                value_prediction_mean_by_reservoir=predictions.mean(axis=(0, 1)).tolist(),
+                gae_target_rmse_by_reservoir=np.sqrt(
+                    np.mean((targets-predictions)**2, axis=(0, 1))).tolist())
 
 
     @torch.no_grad()
@@ -449,7 +469,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         credit = compute_counterfactual_credit(env.physics, env.operation_reward,
             self.critic.get_values, self.value_normalizer, self.counterfactual_context,
             cb.share_obs[1:], self.counterfactual_probabilities, cb.masks[1:],
-            cb.gamma, batch_size=self.counterfactual_batch_size)
+            cb.gamma, batch_size=self.counterfactual_batch_size,
+            observation_data=self.data)
         next_values = cb.value_preds[1:]
         if self.value_normalizer is not None:
             next_values = self.value_normalizer.denormalize(next_values)
@@ -514,7 +535,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 for i, info in enumerate(actor_info):
                     row.update({'actor{}_{}'.format(i,name):float(value) for name,value in info.items()})
                 row.update({'critic_'+name:float(value) for name,value in critic_info.items()})
-                if not all(np.isfinite(value) for value in row.values()):
+                if not all(np.isfinite(np.asarray(value)).all() for value in row.values()):
                     raise FloatingPointError('Non-finite training diagnostics')
                 self.training_history.append(row)
                 optimization_keys = ('optimizer_steps','ratio_samples','ppo_epochs_completed')

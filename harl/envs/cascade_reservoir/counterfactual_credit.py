@@ -10,11 +10,12 @@ import numpy as np
 import torch
 
 from harl.envs.cascade_reservoir.batched_physics import batched_transition
-from harl.envs.cascade_reservoir.cascade_reservoir_env import critic_state_size
+from harl.envs.cascade_reservoir.cascade_reservoir_env import (
+    actor_observations_from_components, critic_state_size)
 from harl.envs.cascade_reservoir.reward import validate_discount_factor
 
 
-ACTOR_CREDIT_MODES = ('team_gae', 'counterfactual')
+ACTOR_CREDIT_MODES = ('team_gae', 'mixed_gae', 'counterfactual')
 COUNTERFACTUAL_NORMALIZATION = 'common_controllable_rms_without_centering'
 
 
@@ -87,12 +88,13 @@ def normalize_counterfactual_advantages(raw_advantages, controls):
 
 @torch.no_grad()
 def compute_counterfactual_credit(physics, operation_reward, critic, value_normalizer,
-        context, next_states, policy_probabilities, continuation_masks, gamma, batch_size=4096):
+        context, next_states, policy_probabilities, continuation_masks, gamma,
+        batch_size=4096, observation_data=None):
     """Return frozen Q grids, baselines, per-actor credit and one common scale.
 
     Context arrays storage_start/external/actions/storage_lower/storage_upper
     and optional controls are [T,N,5]; actions are original integer commands.
-    Extra context provenance fields are ignored. Next states are [T,N,23/43],
+    Extra context provenance fields are ignored. Next states are [T,N,110],
     old probabilities [T,N,5,K], continuation masks [T,N,1]. Call before any
     actor, critic or ValueNorm update. Candidate batches never exceed batch_size.
 
@@ -133,17 +135,37 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
     if not np.isin(controls, (0., 1.)).all():
         raise ValueError('Counterfactual controls must be binary')
     states = np.asarray(next_states)
-    state_sizes = tuple(critic_state_size(limits) for limits in (False, True))
-    if (states.ndim != 3 or states.shape[:2] != (time, lanes) or states.shape[-1] not in state_sizes
+    state_size = critic_state_size()
+    if (states.ndim != 3 or states.shape[:2] != (time, lanes) or states.shape[-1] != state_size
             or not np.isfinite(states).all()):
-        raise ValueError('Counterfactual next states must be finite [time, lanes, 23/43] arrays')
+        raise ValueError('Counterfactual next states must be finite [time, lanes, 110] arrays')
     states = states.astype(np.float32, copy=False).reshape(-1, states.shape[-1])
     masks = _finite_array(continuation_masks, (time, lanes, 1), 'continuation masks').reshape(-1)
     if not np.isin(masks, (0., 1.)).all():
         raise ValueError('Continuation masks must be binary')
     data = physics.data
-    span = _finite_array(data.vmax-data.vmin, (5,), 'storage span')
-    caps = _finite_array(data.release_cap, (5,), 'release capacity')
+    # Parallel workers can use different source-year windows while sharing one
+    # base calendar. Candidate observations therefore resolve dates against the
+    # caller's full observation data when supplied, not just lane zero's view.
+    observation = data if observation_data is None else observation_data
+    dates = context.get('dates')
+    if dates is None:
+        raise ValueError('Counterfactual context requires action dates for 110-feature state reconstruction')
+    date_array = np.asarray(dates, dtype=object)
+    if date_array.shape != (time, lanes):
+        raise ValueError('Counterfactual action dates must have shape [time, lanes]')
+    date_to_index = {day.isoformat(): i for i, day in enumerate(observation.dates)}
+    next_indices = np.empty((time, lanes), dtype=np.int64)
+    for t in range(time):
+        for lane in range(lanes):
+            day = date_array[t, lane]
+            try:
+                source_index = date_to_index[day.isoformat() if hasattr(day, 'isoformat') else str(day)]
+            except KeyError as exc:
+                raise ValueError('Counterfactual action date is outside the source calendar') from exc
+            next_indices[t, lane] = source_index+1
+    span = _finite_array(observation.vmax-observation.vmin, (5,), 'storage span')
+    caps = _finite_array(observation.release_cap, (5,), 'release capacity')
     if (span <= 0.).any() or (caps <= 0.).any():
         raise ValueError('Storage spans and release capacities must be positive')
     rows = time*lanes
@@ -163,9 +185,11 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
         q = system_rewards_from_dispatch(operation_reward, dispatch)
         continuing = masks[row] > 0.
         if gamma > 0. and continuing.any():
-            candidate = states[row[continuing]].copy()
-            candidate[:, :5] = (dispatch['storage_end'][continuing]-data.vmin)/span
-            candidate[:, 10:15] = dispatch['release'][continuing]/caps
+            candidate = actor_observations_from_components(observation, observation.daily_level_limits,
+                dispatch['storage_end'][continuing], dispatch['release'][continuing],
+                normalized[continuing], dispatch['actions'][continuing],
+                dispatch['power'][continuing], dispatch['turbine'][continuing],
+                next_indices.reshape(-1)[row[continuing]]).reshape(-1, state_size)
             prediction = predict(candidate)
             if isinstance(prediction, torch.Tensor):
                 prediction = prediction.detach().cpu().numpy()

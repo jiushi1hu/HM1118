@@ -8,8 +8,9 @@ train:
   use_linear_lr_decay: false
   use_proper_time_limits: true
 model:
-  # Actor inputs include the local issued 7-day inflow forecast (16 features
-  # with daily limits, 12 without). The centralized critic receives 43/23.
+  # Every actor uses the same 22-feature local/upstream/downstream/system
+  # layout. The centralized critic receives the five observations concatenated
+  # in WDD/BHT/XLD/XJB/THR order (110 features).
   # Flattened encoder [64, 128, 256] + one 256-unit hidden head.
   # Actors and the critic build separate MLPs with this same layout.
   hidden_sizes: [64, 128, 256, 256]
@@ -24,8 +25,10 @@ model:
   action_distribution: categorical
   action_bins: 100
 algo:
-  # Opt-in model-assisted actor estimator; the scalar critic keeps its GAE targets.
-  happo_credit_assignment: team_gae  # counterfactual compares all discrete commands
+  # team_gae: shared system-reward GAE and one critic value.
+  # mixed_gae: per-reservoir mixed-reward GAE and five critic values.
+  # counterfactual: model-assisted one-step actor credit; critic keeps team GAE.
+  happo_credit_assignment: team_gae
   counterfactual_batch_size: 4096  # Maximum physics/critic candidate batch
   gamma: 0.995  # Discount for GAE, critic returns and return accounting; actor rows have no extra time weight.
   gae_lambda: 0.95
@@ -46,7 +49,7 @@ algo:
   use_policy_active_masks: true
   action_aggregation: prod
   entropy_coef: 0.001
-  normalize_shared_advantages: true  # MAPPO: per-reservoir normalization; HAPPO always normalizes its team advantage once.
+  normalize_shared_advantages: true  # MAPPO toggles per-reservoir common-row normalization; HAPPO mixed_gae always uses common rows; team_gae normalizes once.
   mask_inactive_factors: true
 experiment:
   collection_mode: five_year_parallel

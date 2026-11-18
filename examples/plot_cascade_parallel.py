@@ -19,7 +19,7 @@ def learning_return_kind(payload):
     layout = objective.get('critic_reward_layout', payload.get('critic_reward_layout'))
     if layout == 'shared_team':
         return 'shared_team'
-    if layout == 'mixed_by_reservoir_then_legacy_team':
+    if layout in ('mixed_by_reservoir', 'mixed_by_reservoir_then_legacy_team'):
         return 'individual_mixed'
     source = objective.get('advantage_source')
     if source in ('shared_team', 'counterfactual_shared_team'):

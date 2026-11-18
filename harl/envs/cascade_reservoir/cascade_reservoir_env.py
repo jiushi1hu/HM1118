@@ -2,36 +2,163 @@
 import calendar
 import numpy as np
 from gym.spaces import Box, Discrete
+from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.reservoir_physics import (
     ReservoirPhysics, InfeasibleCascade)
 from harl.envs.cascade_reservoir.reward import OperationReward, reward_settings
 from harl.envs.cascade_reservoir.episodes import (
     DEFAULT_EPISODE_DAYS, DEFAULT_ACTION_BINS, positive_integer)
 
-ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_next7d_forecast_v6'
-CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_v3'
-LOCAL_NEIGHBOR_FEATURES = (
-    'storage_fraction', 'external_inflow_standardized', 'previous_release_fraction',
-    'upstream_storage_fraction', 'upstream_external_inflow_standardized',
-    'upstream_previous_release_fraction', 'downstream_storage_fraction',
-    'downstream_headroom_fraction',
+ACTOR_OBSERVATION_LAYOUT = 'cascade_local_upstream_downstream_system_v7'
+CRITIC_STATE_LAYOUT = 'concatenated_five_actor_observations_v1'
+
+# The order is a public data contract. Keep it identical for every reservoir.
+ACTOR_OBSERVATION_FEATURES = (
+    'current_water_level_fraction',
+    'actual_total_inflow_fraction_of_release_capacity',
+    'next7d_mean_incremental_inflow_forecast_standardized',
+    'season_sin',
+    'season_cos',
+    'next_day_max_permitted_water_level_fraction',
+    'next_day_min_permitted_water_level_fraction',
+    'previous_requested_normalized_action',
+    'current_storage_ratio',
+    'remaining_regulation_capacity_ratio',
+    'actual_total_release_fraction_of_release_capacity',
+    'actual_turbine_release_fraction_of_turbine_capacity',
+    'actual_power_fraction_of_installed_capacity',
+    'realized_action_after_environmental_correction',
+    'upstream_water_level_fraction',
+    'upstream_actual_release_fraction_of_release_capacity',
+    'upstream_next7d_mean_incremental_inflow_forecast_standardized',
+    'downstream_water_level_fraction',
+    'downstream_remaining_regulation_capacity_ratio',
+    'total_storage_fraction_of_combined_normal_storage',
+    'total_power_fraction_of_total_installed_capacity',
+    'flood_season_indicator',
 )
-LOCAL_RULE_FEATURES = (
-    'current_state_storage_lower_fraction', 'current_state_storage_upper_fraction',
-    'next_day_level_lower_fraction', 'next_day_level_upper_fraction',
-)
-TIME_FEATURES = ('season_sin', 'season_cos', 'episode_time_remaining_fraction')
-FORECAST_FEATURES = ('next7d_mean_inflow_forecast_standardized',)
+ACTOR_OBSERVATION_SIZE = len(ACTOR_OBSERVATION_FEATURES)
+CRITIC_STATE_SIZE = len(IDS) * ACTOR_OBSERVATION_SIZE
 
 
-def actor_observation_features(use_daily_level_limits):
-    return (LOCAL_NEIGHBOR_FEATURES + (LOCAL_RULE_FEATURES if use_daily_level_limits else ()) +
-            TIME_FEATURES + FORECAST_FEATURES)
+def actor_observation_features(use_daily_level_limits=None):
+    """Return the fixed 22-feature contract; daily limits change values, not layout."""
+    return ACTOR_OBSERVATION_FEATURES
 
 
-def critic_state_size(use_daily_level_limits):
-    """Physical prefix followed by all five issued inflow forecasts."""
-    return (38 if use_daily_level_limits else 18)+5
+def critic_state_size(use_daily_level_limits=None):
+    """The critic receives WDD/BHT/XLD/XJB/THR observations in that order."""
+    return CRITIC_STATE_SIZE
+
+
+def _level_curve(data, storage):
+    """Evaluate the supplied monotone storage-to-level anchors on row vectors."""
+    storage = np.asarray(storage, dtype=np.float64)
+    if storage.ndim != 2 or storage.shape[1] != len(IDS):
+        raise ValueError('Water-level lookup requires a (rows, 5) storage matrix')
+    levels = np.empty_like(storage)
+    for i, name in enumerate(IDS):
+        points = data.anchors[name]
+        levels[:, i] = np.interp(storage[:, i], points[:, 1], points[:, 0])
+    return levels
+
+
+def actor_observations_from_components(data, level_limits, storage, previous_release,
+        previous_requested_action, previous_realized_action, previous_power,
+        previous_turbine, index):
+    """Build the exact 22-feature layout from decision-time components.
+
+    ``actual_total_inflow`` is the physically available inflow at the decision
+    instant: external/incremental inflow plus the previous day's executed
+    upstream release. The current upstream release is not known yet. The
+    forecast is the supplied issued forecast of local incremental inflow and is
+    standardized with training-year actual-inflow statistics, never recomputed
+    from future observations. Levels use the configured operating-level range;
+    flows use release/turbine capacity; power uses installed capacity.
+    """
+    storage = np.asarray(storage, dtype=np.float64)
+    if storage.ndim != 2 or storage.shape[1] != len(IDS):
+        raise ValueError('Observation storage must have shape (rows, 5)')
+    rows = storage.shape[0]
+    index = np.asarray(index, dtype=np.int64).reshape(-1)
+    if index.shape != (rows,):
+        raise ValueError('Observation index must have one entry per storage row')
+    fields = (previous_release, previous_requested_action, previous_realized_action,
+              previous_power, previous_turbine)
+    arrays = [np.asarray(value, dtype=np.float64) for value in fields]
+    if any(value.shape != storage.shape or not np.isfinite(value).all() for value in arrays):
+        raise ValueError('Observation components must be finite (rows, 5) matrices')
+    previous_release, previous_requested_action, previous_realized_action, previous_power, previous_turbine = arrays
+    if ((previous_requested_action < 0.) | (previous_requested_action > 1.)).any():
+        raise ValueError('Previous requested actions must be normalized to [0, 1]')
+    if ((previous_realized_action < 0.) | (previous_realized_action > 1.)).any():
+        raise ValueError('Previous realized actions must be normalized to [0, 1]')
+
+    levels = _level_curve(data, storage)
+    external = np.asarray(data.external[index], dtype=np.float64)
+    forecast = np.asarray(data.inflow_forecast[index], dtype=np.float64)
+    if external.shape != storage.shape or forecast.shape != storage.shape:
+        raise ValueError('Observation forcing arrays must match storage rows')
+    total_inflow = external.copy()
+    total_inflow[:, 1:] += previous_release[:, :-1]
+    forecast_standardized = (forecast-data.flow_mean)/data.flow_std
+
+    storage_span = data.vmax-data.vmin
+    level_min, level_max = data.levels(data.vmin), data.levels(data.vmax)
+    level_span = level_max-level_min
+    storage_ratio = (storage-data.vmin)/storage_span
+    remaining_ratio = np.clip((data.vmax-storage)/storage_span, 0., 1.)
+    release_fraction = previous_release/data.release_cap
+    turbine_fraction = previous_turbine/data.turbine_cap
+    power_fraction = previous_power/data.power_cap
+
+    if level_limits is None:
+        next_lower = np.broadcast_to(data.levels(data.vmin), storage.shape)
+        next_upper = np.broadcast_to(data.levels(data.vmax), storage.shape)
+    else:
+        next_lower = np.asarray(level_limits.level_lower[index], dtype=np.float64)
+        next_upper = np.asarray(level_limits.level_upper[index], dtype=np.float64)
+    if next_lower.shape != storage.shape or next_upper.shape != storage.shape:
+        raise ValueError('Next-day level bounds must match observation rows')
+
+    phases = np.asarray([2.*np.pi*(data.dates[i].timetuple().tm_yday-1)/
+                         (366 if calendar.isleap(data.dates[i].year) else 365)
+                         for i in index], dtype=np.float64)
+    flood = np.asarray([1. if 6 <= data.dates[i].month <= 9 else 0. for i in index], dtype=np.float64)
+    system_storage = storage.sum(axis=1)/data.vmax.sum()
+    system_power = previous_power.sum(axis=1)/data.power_cap.sum()
+
+    observations = np.zeros((rows, len(IDS), ACTOR_OBSERVATION_SIZE), dtype=np.float64)
+    for i in range(len(IDS)):
+        observations[:, i, 0] = (levels[:, i]-level_min[i])/level_span[i]
+        observations[:, i, 1] = total_inflow[:, i]/data.release_cap[i]
+        observations[:, i, 2] = forecast_standardized[:, i]
+        observations[:, i, 3] = np.sin(phases)
+        observations[:, i, 4] = np.cos(phases)
+        observations[:, i, 5] = (next_upper[:, i]-level_min[i])/level_span[i]
+        observations[:, i, 6] = (next_lower[:, i]-level_min[i])/level_span[i]
+        observations[:, i, 7] = previous_requested_action[:, i]
+        observations[:, i, 8] = storage_ratio[:, i]
+        observations[:, i, 9] = remaining_ratio[:, i]
+        observations[:, i, 10] = release_fraction[:, i]
+        observations[:, i, 11] = turbine_fraction[:, i]
+        observations[:, i, 12] = power_fraction[:, i]
+        observations[:, i, 13] = previous_realized_action[:, i]
+        if i:
+            observations[:, i, 14] = (levels[:, i-1]-level_min[i-1])/level_span[i-1]
+            observations[:, i, 15] = release_fraction[:, i-1]
+            observations[:, i, 16] = forecast_standardized[:, i-1]
+        if i < len(IDS)-1:
+            observations[:, i, 17] = (levels[:, i+1]-level_min[i+1])/level_span[i+1]
+            observations[:, i, 18] = remaining_ratio[:, i+1]
+        else:
+            observations[:, i, 18] = 1.
+        observations[:, i, 19] = system_storage
+        observations[:, i, 20] = system_power
+        observations[:, i, 21] = flood
+    if not np.isfinite(observations).all():
+        raise FloatingPointError('Non-finite reservoir actor observations')
+    return observations.astype(np.float32)
 
 
 class CascadeReservoirEnv:
@@ -42,7 +169,20 @@ class CascadeReservoirEnv:
     def observation_metadata(self):
         return dict(actor_observation_layout=self.observation_layout,
                     actor_observation_size=self.observation_size,
+                    actor_observation_features=list(self.observation_features),
                     critic_state_layout=self.critic_state_layout, critic_state_size=self.state_size,
+                    critic_input_layout='concatenated_actor_observations_WDD_BHT_XLD_XJB_THR',
+                    feature_normalization=dict(
+                        water_level='(level - operating_level_min) / operating_level_span',
+                        total_inflow='actual available total inflow / release capacity',
+                        forecast='issued next-7-day mean incremental inflow, training-year standardized',
+                        release='actual total release / release capacity',
+                        turbine='actual turbine release / turbine capacity',
+                        power='actual power / installed capacity',
+                        storage='(storage - operating_storage_min) / operating_storage_span',
+                        remaining_regulation='(normal_storage - storage) / operating_storage_span',
+                        system_storage='total storage / combined normal storage',
+                        system_power='total power / total installed capacity'),
                     end_storage_policy='unconstrained_within_daily_operating_bounds')
 
     def __init__(self, data, config, start_year=None, action_bins=DEFAULT_ACTION_BINS,
@@ -71,6 +211,8 @@ class CascadeReservoirEnv:
         self.observation_features = actor_observation_features(self.use_daily_level_limits)
         self.observation_size = len(self.observation_features)
         self.state_size = critic_state_size(self.use_daily_level_limits)
+        if self.observation_size != 22 or self.state_size != 110:
+            raise ValueError('The cascade observation contract requires 22 actor and 110 critic features')
         self.observation_space = [Box(-np.inf, np.inf, (self.observation_size,), dtype=np.float32) for _ in range(5)]
         self.share_observation_space = [Box(-np.inf, np.inf, (self.state_size,), dtype=np.float32) for _ in range(5)]
         if (isinstance(action_bins, bool) or
@@ -111,65 +253,28 @@ class CascadeReservoirEnv:
         self.index = self.start
         self.storage = storage
         self.previous_release = np.zeros(5)
+        self.previous_requested_action = np.zeros(5)
+        self.previous_realized_action = np.zeros(5)
+        self.previous_power = np.zeros(5)
+        self.previous_turbine = np.zeros(5)
         self.last_transition = None
         return self._observations()
 
     def state(self):
-        """Physical state and the forecast issued on the current decision date.
-
-        Forecasts are issued on the current source date; no future observed
-        inflow is read. The original physical-state prefix retains its layout.
-        """
+        """Concatenate WDD/BHT/XLD/XJB/THR actor observations for the critic."""
         if self.index == self.stop:
             return np.zeros(self.state_size, dtype=np.float32)
-        day = self.data.dates[self.index]
-        phase = 2.*np.pi*(day.timetuple().tm_yday-1)/(366 if calendar.isleap(day.year) else 365)
-        parts = [
-            (self.storage-self.data.vmin)/self._storage_span,
-            (self.data.external[self.index]-self.data.flow_mean)/self.data.flow_std,
-            self.previous_release/self.data.release_cap,
-            [np.sin(phase),np.cos(phase)],
-            [(self.stop-self.index)/self.time_scale_days],
-        ]
-        if self.level_limits is not None:
-            lower, upper = self._current_state_storage_bounds(self.index)
-            next_lower, next_upper = self._next_state_level_bounds(self.index)
-            # The CSV row for action date t already describes H[t+1]. There
-            # is no extra date shift, even at a source-year or episode boundary.
-            parts.extend([(lower-self.data.vmin)/self._storage_span,
-                          (upper-self.data.vmin)/self._storage_span,
-                          (next_lower-self._level_min)/self._level_span,
-                          (next_upper-self._level_min)/self._level_span])
-        forecast = (self.data.inflow_forecast[self.index]-self.data.flow_mean)/self.data.flow_std
-        parts.append(forecast)
-        return np.concatenate(parts).astype(np.float32)
+        return self.actor_observations().reshape(-1).copy()
 
     def actor_observations(self):
-        """Local state, neighbors, operating limits and issued inflow forecast.
-
-        Reservoirs choose actions before upstream releases are resolved, so
-        the upstream release feature is yesterday's release. Downstream
-        headroom is signed room below the upper bound for the next state.
-        """
+        """Return the fixed local/upstream/downstream/shared-system layout."""
         if self.index == self.stop:
             return np.zeros((5,self.observation_size),dtype=np.float32)
-        state = self.state()
-        storage, external, release = state[:5], state[5:10], state[10:15]
-        # Supplied date-t forecast only. Reuse training-only actual-inflow
-        # statistics, with the same external/interval definitions and IDS order.
-        forecast = state[-5:]
-        upper = (self._next_state_storage_bounds(self.index)[1]-self.data.vmin)/self._storage_span
-        observations = []
-        for i in range(5):
-            upstream = (storage[i-1],external[i-1],release[i-1]) if i else (0.,0.,0.)
-            downstream = (storage[i+1],upper[i+1]-storage[i+1]) if i < 4 else (0.,1.)
-            local = [storage[i],external[i],release[i],*upstream,*downstream]
-            if self.level_limits is not None:
-                local.extend(state[start+i] for start in (18,23,28,33))
-            local.extend(state[15:18])
-            local.append(forecast[i])
-            observations.append(local)
-        return np.asarray(observations,dtype=np.float32)
+        return actor_observations_from_components(self.data, self.level_limits,
+            self.storage[None], self.previous_release[None],
+            self.previous_requested_action[None], self.previous_realized_action[None],
+            self.previous_power[None], self.previous_turbine[None],
+            np.asarray([self.index], dtype=np.int64))[0]
 
     def _observations(self):
         state = np.repeat(self.state()[None,:],5,axis=0)
@@ -199,6 +304,7 @@ class CascadeReservoirEnv:
                 exc,self.data.dates[self.index],self.storage.tolist(),actions.reshape(5).tolist())) from exc
         result['date'] = self.data.dates[self.index].isoformat()
         result['sampled_actions'] = actions.reshape(5).astype(np.int64).copy()
+        result['requested_normalized_actions'] = normalized.copy()
         result['action_bins'] = self.action_bins
         result['timestep_seconds'] = self.physics.dt
         result['daily_level_limits'] = self.use_daily_level_limits
@@ -219,6 +325,10 @@ class CascadeReservoirEnv:
         self.last_transition = result
         self.storage = result['storage_end'].copy()
         self.previous_release = result['release'].copy()
+        self.previous_requested_action = normalized.copy()
+        self.previous_realized_action = result['normalized_actions'].copy()
+        self.previous_power = result['power'].copy()
+        self.previous_turbine = result['turbine'].copy()
         self.index += 1
         done = self.index == self.stop
         obs,state,available = self._observations()

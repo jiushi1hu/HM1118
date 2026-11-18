@@ -47,8 +47,8 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     parser.add_argument('--action-bins',type=int,help='Discrete actions per reservoir (default: 100)')
     parser.add_argument('--gamma',type=float,help='Discount factor in [0,1]; 1 gives undiscounted episode return')
     parser.add_argument('--gae-lambda',type=float,help='GAE trace parameter in [0,1]')
-    parser.add_argument('--happo-credit-assignment',choices=('team_gae','counterfactual'),
-                        help='Actor credit: baseline shared team GAE or model-assisted one-step counterfactual Q differences')
+    parser.add_argument('--happo-credit-assignment',choices=('team_gae','mixed_gae','counterfactual'),
+                        help='HAPPO advantage mode: shared team GAE, per-reservoir mixed-reward GAE, or model-assisted one-step counterfactual Q differences')
     parser.add_argument('--counterfactual-batch-size',type=int,
                         help='Maximum candidate rows per batched physics/critic call (default: 4096)')
     parser.add_argument('--ppo-epochs',type=int,help='Actor optimization epochs per collection round')
