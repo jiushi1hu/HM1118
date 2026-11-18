@@ -7,11 +7,9 @@ from harl.envs.cascade_reservoir.reservoir_physics import (
 from harl.envs.cascade_reservoir.reward import OperationReward, reward_settings
 from harl.envs.cascade_reservoir.episodes import (
     DEFAULT_EPISODE_DAYS, DEFAULT_ACTION_BINS, positive_integer)
-from harl.envs.cascade_reservoir.terminal_forecast import (
-    TerminalForecastBudget, TERMINAL_FORECAST_MODEL, TERMINAL_MECHANISM)
 
-ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_terminal_target_next7d_forecast_future_volume_v5'
-CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_forecasts_targets_future_volumes_v2'
+ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_next7d_forecast_v6'
+CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_v3'
 LOCAL_NEIGHBOR_FEATURES = (
     'storage_fraction', 'external_inflow_standardized', 'previous_release_fraction',
     'upstream_storage_fraction', 'upstream_external_inflow_standardized',
@@ -23,19 +21,17 @@ LOCAL_RULE_FEATURES = (
     'next_day_level_lower_fraction', 'next_day_level_upper_fraction',
 )
 TIME_FEATURES = ('season_sin', 'season_cos', 'episode_time_remaining_fraction')
-TERMINAL_TARGET_FEATURES = ('terminal_target_storage_fraction',)
 FORECAST_FEATURES = ('next7d_mean_inflow_forecast_standardized',)
-FUTURE_VOLUME_FEATURES = ('remaining_external_volume_normalized',)
 
 
 def actor_observation_features(use_daily_level_limits):
     return (LOCAL_NEIGHBOR_FEATURES + (LOCAL_RULE_FEATURES if use_daily_level_limits else ()) +
-            TIME_FEATURES + TERMINAL_TARGET_FEATURES + FORECAST_FEATURES + FUTURE_VOLUME_FEATURES)
+            TIME_FEATURES + FORECAST_FEATURES)
 
 
 def critic_state_size(use_daily_level_limits):
-    """Physical prefix, issued forecasts, targets and remaining external volumes."""
-    return (38 if use_daily_level_limits else 18)+15
+    """Physical prefix followed by all five issued inflow forecasts."""
+    return (38 if use_daily_level_limits else 18)+5
 
 
 class CascadeReservoirEnv:
@@ -47,11 +43,7 @@ class CascadeReservoirEnv:
         return dict(actor_observation_layout=self.observation_layout,
                     actor_observation_size=self.observation_size,
                     critic_state_layout=self.critic_state_layout, critic_state_size=self.state_size,
-                    terminal_storage_equal_initial=self.terminal_storage_equal_initial,
-                    terminal_storage_mechanism=(TERMINAL_MECHANISM
-                                                if self.terminal_target is not None else 'disabled'),
-                    terminal_forecast_model=(TERMINAL_FORECAST_MODEL
-                                             if self.terminal_target is not None else 'disabled'))
+                    end_storage_policy='unconstrained_within_daily_operating_bounds')
 
     def __init__(self, data, config, start_year=None, action_bins=DEFAULT_ACTION_BINS,
                  episode_days=DEFAULT_EPISODE_DAYS):
@@ -86,16 +78,7 @@ class CascadeReservoirEnv:
             raise ValueError('action_bins must be an integer >= 2')
         self.action_bins = action_bins
         self.action_space = [Discrete(action_bins) for _ in range(5)]
-        self.terminal_storage_equal_initial = config.get('terminal_storage_equal_initial', False)
-        if not isinstance(self.terminal_storage_equal_initial, bool):
-            raise ValueError('terminal_storage_equal_initial must be a boolean')
         self.initial_storage = data.initial_storage(data.dates[self.start].year)
-        self.terminal_target = (self.initial_storage.copy()
-                                if self.terminal_storage_equal_initial else None)
-        self.terminal_forecast_budget = (TerminalForecastBudget(
-            data, self.start, self.stop, self.physics.dt) if self.terminal_target is not None else None)
-        self._future_volume_scale = (np.maximum(data.flow_mean, 1.)*
-                                     self.physics.dt*self.time_scale_days)
         self.reset()
 
     def _next_state_storage_bounds(self, index):
@@ -129,21 +112,10 @@ class CascadeReservoirEnv:
         self.storage = storage
         self.previous_release = np.zeros(5)
         self.last_transition = None
-        self.terminal_report = None
-        self.terminal_infeasible_days = np.zeros(5, dtype=np.int64)
-        self.terminal_infeasible_steps = 0
-        self.terminal_rejected_steps = 0
-        self.terminal_fallback_steps = 0
         return self._observations()
 
-    def _future_external_volume(self):
-        if self.terminal_forecast_budget is None or self.index == self.stop:
-            return np.zeros(5)
-        return self.terminal_forecast_budget.future_volume(
-            self.index, self.data.inflow_forecast[self.index])
-
     def state(self):
-        """Physical state, date-t supplied forecasts and fixed terminal targets.
+        """Physical state and the forecast issued on the current decision date.
 
         Forecasts are issued on the current source date; no future observed
         inflow is read. The original physical-state prefix retains its layout.
@@ -169,13 +141,11 @@ class CascadeReservoirEnv:
                           (next_lower-self._level_min)/self._level_span,
                           (next_upper-self._level_min)/self._level_span])
         forecast = (self.data.inflow_forecast[self.index]-self.data.flow_mean)/self.data.flow_std
-        target = (np.zeros(5) if self.terminal_target is None else
-                  (self.terminal_target-self.data.vmin)/self._storage_span)
-        parts.extend([forecast, target, self._future_external_volume()/self._future_volume_scale])
+        parts.append(forecast)
         return np.concatenate(parts).astype(np.float32)
 
     def actor_observations(self):
-        """Local state, neighbors, operating limits, terminal target and forecast.
+        """Local state, neighbors, operating limits and issued inflow forecast.
 
         Reservoirs choose actions before upstream releases are resolved, so
         the upstream release feature is yesterday's release. Downstream
@@ -187,7 +157,7 @@ class CascadeReservoirEnv:
         storage, external, release = state[:5], state[5:10], state[10:15]
         # Supplied date-t forecast only. Reuse training-only actual-inflow
         # statistics, with the same external/interval definitions and IDS order.
-        forecast, target, future_volume = state[-15:-10], state[-10:-5], state[-5:]
+        forecast = state[-5:]
         upper = (self._next_state_storage_bounds(self.index)[1]-self.data.vmin)/self._storage_span
         observations = []
         for i in range(5):
@@ -197,7 +167,7 @@ class CascadeReservoirEnv:
             if self.level_limits is not None:
                 local.extend(state[start+i] for start in (18,23,28,33))
             local.extend(state[15:18])
-            local.extend((target[i], forecast[i], future_volume[i]))
+            local.append(forecast[i])
             observations.append(local)
         return np.asarray(observations,dtype=np.float32)
 
@@ -223,11 +193,6 @@ class CascadeReservoirEnv:
             self._check_current_storage(self.storage,self.index)
             lower, upper = self._next_state_storage_bounds(self.index)
             bounds = dict(storage_lower=lower, storage_upper=upper)
-            if self.terminal_target is not None:
-                bounds['terminal'] = dict(target=self.terminal_target,
-                    remaining_days=int(self.stop-self.index),
-                    forecast=self.data.inflow_forecast[self.index],
-                    future_external_volume_m3=self._future_external_volume())
             result = self.physics.transition(self.storage,self.data.external[self.index],normalized,**bounds)
         except RuntimeError as exc:
             raise type(exc)('{}; date={} storage_m3={} actions={}'.format(
@@ -236,8 +201,6 @@ class CascadeReservoirEnv:
         result['sampled_actions'] = actions.reshape(5).astype(np.int64).copy()
         result['action_bins'] = self.action_bins
         result['timestep_seconds'] = self.physics.dt
-        result['terminal_forecast_assumption'] = (TERMINAL_FORECAST_MODEL
-            if self.terminal_target is not None else 'disabled')
         result['daily_level_limits'] = self.use_daily_level_limits
         result['normalized_actions'] = result['actions'].copy()
         result['actions'] = np.where(result['controls'] > 0,actions.reshape(5),0).astype(np.int64)
@@ -245,8 +208,7 @@ class CascadeReservoirEnv:
         result['levels_end'] = self.data.levels(result['storage_end'])
         next_level_lower, next_level_upper = self._next_state_level_bounds(self.index)
         result.update(next_state_level_lower_m=next_level_lower.copy(),
-                      next_state_level_upper_m=next_level_upper.copy(),
-                      terminal_storage_equal_initial=self.terminal_storage_equal_initial)
+                      next_state_level_upper_m=next_level_upper.copy())
         self.operation_reward.apply(result)
         infos = [dict(bad_transition=False,use_daily_level_limits=self.use_daily_level_limits) for _ in range(5)]
         if self.level_limits is not None:
@@ -258,33 +220,7 @@ class CascadeReservoirEnv:
         self.storage = result['storage_end'].copy()
         self.previous_release = result['release'].copy()
         self.index += 1
-        if self.terminal_target is not None:
-            infeasible = np.asarray(result['terminal_window_infeasible'], dtype=bool)
-            self.terminal_infeasible_days += infeasible
-            self.terminal_infeasible_steps += int(infeasible.any())
-            self.terminal_rejected_steps += int(result.get('terminal_plan_rejected', False))
-            self.terminal_fallback_steps += int(result.get('terminal_fallback', False))
         done = self.index == self.stop
-        if done and self.terminal_target is not None:
-            self.terminal_report = self._terminal_report()
-            result['terminal_report'] = self.terminal_report
         obs,state,available = self._observations()
         return obs,state,result['mixed_rewards'].astype(np.float32).reshape(5,1), \
             np.full(5,done,dtype=bool),infos,available
-
-    def _terminal_report(self):
-        """Report the realised terminal deviation without repairing storage."""
-        deviation = self.storage-self.initial_storage
-        tolerance = np.maximum(1e-3, 1e-10*np.abs(self.initial_storage))
-        return dict(enabled=True, mechanism=TERMINAL_MECHANISM,
-            target_m3=self.initial_storage.tolist(), final_storage_m3=self.storage.tolist(),
-            deviation_m3=deviation.tolist(), max_abs_deviation_m3=float(np.abs(deviation).max()),
-            tolerance_m3=tolerance.tolist(),
-            met=bool((np.abs(deviation) <= tolerance).all()),
-            infeasible_days_by_reservoir=[int(value) for value in self.terminal_infeasible_days],
-            infeasible_steps=int(self.terminal_infeasible_steps),
-            forecast_extrapolation=TERMINAL_FORECAST_MODEL,
-            rejected_plan_steps=int(self.terminal_rejected_steps),
-            terminal_fallback_steps=int(self.terminal_fallback_steps),
-            feasibility_scope='necessary forecast water-budget constraints; not full-horizon robust feasibility',
-            storage_overwritten=False)

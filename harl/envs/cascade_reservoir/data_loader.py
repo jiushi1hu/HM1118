@@ -157,9 +157,6 @@ class CascadeData:
         train_flow = self.external[self.train_mask]
         self.flow_mean = train_flow.mean(axis=0)
         self.flow_std = np.maximum(train_flow.std(axis=0), 1.0)
-        from harl.envs.cascade_reservoir.terminal_forecast import fit_seasonal_external_flow
-        self.seasonal_external_flow_m3s = fit_seasonal_external_flow(
-            self.dates, self.external, self.training_years)
         self.inflow_forecast = load_inflow_forecast(self.root / INFLOW_FORECAST_FILE, self.dates)
         self.hashes[INFLOW_FORECAST_FILE] = hashlib.sha256(
             (self.root / INFLOW_FORECAST_FILE).read_bytes()).hexdigest()

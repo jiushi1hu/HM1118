@@ -351,53 +351,22 @@ class InflowForecastObservationTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         load_inflow_forecast(path, dates)
 
-    def test_actor_forecast_and_remaining_volume_use_training_only_context(self):
+    def test_actor_forecast_uses_training_only_statistics(self):
         from harl.envs.cascade_reservoir.episodes import episode_environment
         train = self.data.external[np.isin(self.data.years, self.data.training_years)]
         np.testing.assert_array_equal(self.data.flow_mean, train.mean(axis=0))
         np.testing.assert_array_equal(self.data.flow_std, np.maximum(train.std(axis=0), 1.))
         self.assertFalse(self.data.inflow_forecast.flags.writeable)
         for daily_limits in (True, False):
-            for terminal_enabled in (True, False):
-                with self.subTest(daily_limits=daily_limits, terminal_enabled=terminal_enabled):
-                    config = dict(self.physical, use_daily_level_limits=daily_limits,
-                                  terminal_storage_equal_initial=terminal_enabled)
-                    env = episode_environment(self.data, config, [1965], days=4)
-                    state, observed = env.state(), env.actor_observations()
-                    storage, external, release = state[:5], state[5:10], state[10:15]
-                    upper = (env._next_state_storage_bounds(env.index)[1]-self.data.vmin)/(self.data.vmax-self.data.vmin)
-                    target = ((self.data.initial_storage(1965)-self.data.vmin)/
-                              (self.data.vmax-self.data.vmin) if terminal_enabled else np.zeros(5))
-                    expected_rows = []
-                    for i in range(5):
-                        upstream = (storage[i-1], external[i-1], release[i-1]) if i else (0., 0., 0.)
-                        downstream = (storage[i+1], upper[i+1]-storage[i+1]) if i < 4 else (0., 1.)
-                        row = [storage[i], external[i], release[i], *upstream, *downstream]
-                        if daily_limits:
-                            row.extend(state[start+i] for start in (18, 23, 28, 33))
-                        row.extend(state[15:18])
-                        row.append(target[i])
-                        expected_rows.append(row)
-                    np.testing.assert_array_equal(observed[:, :-2], np.asarray(expected_rows, dtype=np.float32))
-                    expected = (np.asarray(self.by_date['1965-01-01'])-self.data.flow_mean)/self.data.flow_std
-                    np.testing.assert_array_equal(observed[:, -2], expected.astype(np.float32))
-                    np.testing.assert_array_equal(observed[:, -3], target.astype(np.float32))
-                    volume = (env._future_external_volume()/env._future_volume_scale).astype(np.float32)
-                    np.testing.assert_array_equal(observed[:, -1], volume)
-                    base_size = 38 if daily_limits else 18
-                    np.testing.assert_array_equal(state[base_size:base_size+5], expected.astype(np.float32))
-                    np.testing.assert_array_equal(state[base_size+5:base_size+10], target.astype(np.float32))
-                    np.testing.assert_array_equal(state[-5:], volume)
-                    self.assertEqual(observed.shape, (5, 18 if daily_limits else 14))
-                    self.assertEqual(state.shape, (53 if daily_limits else 33,))
-                    self.assertEqual(env.observation_features[-3:], (
-                        'terminal_target_storage_fraction', 'next7d_mean_inflow_forecast_standardized',
-                        'remaining_external_volume_normalized'))
-                    metadata = env.observation_metadata()
-                    self.assertEqual(metadata['actor_observation_layout'],
-                                     'local_neighbors_next_day_limits_terminal_target_next7d_forecast_future_volume_v5')
-                    self.assertEqual(metadata['critic_state_layout'],
-                                     'system_storage_inflow_release_limits_forecasts_targets_future_volumes_v2')
+            env = episode_environment(self.data, dict(self.physical, use_daily_level_limits=daily_limits), [1965], days=4)
+            state, observed = env.state(), env.actor_observations()
+            expected = ((np.asarray(self.by_date['1965-01-01'])-self.data.flow_mean)/self.data.flow_std).astype(np.float32)
+            np.testing.assert_array_equal(observed[:, -1], expected)
+            np.testing.assert_array_equal(state[-5:], expected)
+            self.assertEqual(observed.shape, (5, 16 if daily_limits else 12))
+            self.assertEqual(state.shape, (43 if daily_limits else 23,))
+            self.assertEqual(env.observation_features[-1], 'next7d_mean_inflow_forecast_standardized')
+            self.assertEqual(env.observation_metadata()['end_storage_policy'], 'unconstrained_within_daily_operating_bounds')
 
     def test_episode_forecasts_keep_source_dates_at_leaps_joins_and_dataset_end(self):
         from harl.envs.cascade_reservoir.episodes import EpisodeData
@@ -418,34 +387,25 @@ class InflowForecastObservationTest(unittest.TestCase):
             changed.external = np.zeros_like(self.data.external)
             np.testing.assert_array_equal(EpisodeData(changed, years, days).inflow_forecast, expected)
 
-    def test_forecast_changes_actor_and_critic_information_and_terminal_scheduling(self):
+    def test_forecast_changes_actor_and_critic_information_without_dispatch_override(self):
         from harl.envs.cascade_reservoir.episodes import episode_environment
         changed = copy.copy(self.data)
         changed.inflow_forecast = self.data.inflow_forecast+10000.*np.arange(1., 6.)
         original = episode_environment(self.data, self.physical, [1965], days=4)
         altered = episode_environment(changed, self.physical, [1965], days=4)
-        np.testing.assert_array_equal(original.state()[:38], altered.state()[:38])
-        np.testing.assert_array_equal(original.state()[-10:-5], altered.state()[-10:-5])
+        np.testing.assert_array_equal(original.state()[:-5], altered.state()[:-5])
         expected_delta = (10000.*np.arange(1., 6.)/self.data.flow_std).astype(np.float32)
-        np.testing.assert_allclose(altered.state()[38:43]-original.state()[38:43],
-                                   expected_delta, rtol=1e-6, atol=1e-6)
-        np.testing.assert_array_equal(original.actor_observations()[:, :-2],
-                                      altered.actor_observations()[:, :-2])
-        self.assertTrue(np.all(original.actor_observations()[:, -2] !=
-                               altered.actor_observations()[:, -2]))
+        np.testing.assert_allclose(altered.state()[-5:]-original.state()[-5:], expected_delta, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(original.actor_observations()[:, :-1], altered.actor_observations()[:, :-1])
         for commands in (np.zeros(5), np.full(5, 99), np.array([3, 11, 45, 70, 90]), np.full(5, 48)):
             original.step(commands)
             altered.step(commands)
-            left, right = original.last_transition, altered.last_transition
-            for field in ('external', 'terminal_target',
-                          'terminal_remaining_days'):
-                np.testing.assert_array_equal(left[field], right[field])
-            self.assertFalse(np.array_equal(left['terminal_forecast'], right['terminal_forecast']))
-        np.testing.assert_array_equal(original.actor_observations(), np.zeros((5, 18), dtype=np.float32))
-        np.testing.assert_array_equal(altered.actor_observations(), original.actor_observations())
-        np.testing.assert_array_equal(original.state(), np.zeros(53, dtype=np.float32))
+            for field in ('external', 'release', 'storage_end', 'controls'):
+                np.testing.assert_array_equal(original.last_transition[field], altered.last_transition[field])
+        np.testing.assert_array_equal(original.actor_observations(), np.zeros((5, 16), dtype=np.float32))
+        np.testing.assert_array_equal(original.state(), np.zeros(43, dtype=np.float32))
 
-    def test_happo_networks_and_rollout_buffers_accept_forecasts_and_terminal_targets(self):
+    def test_happo_networks_and_rollout_buffers_accept_issued_forecasts(self):
         args = copy.deepcopy(self.args)
         args['train'].update(episode_length=4, n_rollout_threads=1)
         args['model'].update(hidden_sizes=[8, 8], action_bins=7)
@@ -456,13 +416,13 @@ class InflowForecastObservationTest(unittest.TestCase):
         obs = runner.envs[0].actor_observations()
         for i, actor in enumerate(runner.actor):
             first_linear = next(layer for layer in actor.actor.modules() if isinstance(layer, torch.nn.Linear))
-            self.assertEqual(first_linear.in_features, 18)
-            self.assertEqual(runner.actor_buffer[i].obs.shape, (5, 1, 18))
+            self.assertEqual(first_linear.in_features, 16)
+            self.assertEqual(runner.actor_buffer[i].obs.shape, (5, 1, 16))
             action = actor.act(obs[i:i+1], deterministic=True)
             self.assertEqual(tuple(action.shape), (1, 1))
         first_critic = next(layer for layer in runner.critic.critic.modules() if isinstance(layer, torch.nn.Linear))
-        self.assertEqual(first_critic.in_features, 53)
-        self.assertEqual(runner.critic_buffer.share_obs.shape, (5, 1, 53))
+        self.assertEqual(first_critic.in_features, 43)
+        self.assertEqual(runner.critic_buffer.share_obs.shape, (5, 1, 43))
 
 
 class MissingWorkflowIntegrationTest(unittest.TestCase):

@@ -1,49 +1,8 @@
-"""Water balance, chain feasibility and a non-anticipative terminal schedule.
-
-Joint terminal release windows use prefix water budgets and supplied future
-external volumes. These forecast conditions do not certify future-envelope
-reachability. An inconsistent nonfinal plan preserves physically available
-actor control; an unreachable final target uses a deterministic safe projection.
-No future observed inflow is read and storage is never repaired.
-"""
+"""Daily water balance, chain feasibility and generation with free end storage."""
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import HEAD_MODELS
 from harl.envs.cascade_reservoir.dispatch_kernel import (
-    InfeasibleCascade, TERMINAL_TOLERANCE, dispatch_release)
-
-
-def terminal_inputs(terminal):
-    """Validate one decision's terminal-scheduling inputs."""
-    try:
-        target = np.asarray(terminal['target'], dtype=np.float64)
-        raw_days = np.asarray(terminal['remaining_days'])
-        forecast = np.asarray(terminal['forecast'], dtype=np.float64)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError('terminal requires target, remaining_days and forecast') from exc
-    if (target.shape != (5,) or forecast.shape != (5,) or
-            not np.isfinite(target).all() or not np.isfinite(forecast).all()):
-        raise ValueError('Terminal target and forecast must be finite five-vectors')
-    if (forecast < 0.).any():
-        raise ValueError('Terminal forecast inflow must be nonnegative')
-    if (raw_days.shape != () or not np.isfinite(raw_days) or raw_days < 1 or
-            raw_days != np.floor(raw_days)):
-        raise ValueError('Terminal scheduling requires a positive integer remaining horizon')
-    days = int(raw_days)
-    return target, days, forecast
-
-
-def terminal_release_window(dt, storage, inflow, target, remaining_days, forecast, capacity):
-    """Legacy budget arithmetic for one outlet, not a reachability certificate.
-
-    For a cascade outlet, storage, target and external forcing must all be
-    prefix sums. Live scalar and batch dispatch instead use the shared kernel,
-    including an explicitly supplied future external volume when available.
-    """
-    future = (int(remaining_days)-1 if np.ndim(remaining_days) == 0 else
-              np.asarray(remaining_days, dtype=np.int64)-1)
-    required = storage+dt*inflow+dt*future*np.maximum(0., forecast)-target
-    upper = required/dt
-    return upper-future*capacity, upper
+    InfeasibleCascade, dispatch_release)
 
 
 class ReservoirPhysics:
@@ -147,15 +106,12 @@ class ReservoirPhysics:
                 raise InfeasibleCascade("Empty downstream-compatible release interval")
         return lo, hi
 
-    def transition(self, storage, external, actions, storage_lower=None, storage_upper=None,
-                   terminal=None):
+    def transition(self, storage, external, actions, storage_lower=None, storage_upper=None):
         """Apply one action using only information available at decision time.
 
-        End-state bounds remain hard. Optional prefix terminal budgets enter a
-        joint backward compatibility pass before any actor release is resolved.
-        A rejected nonfinal forecast plan leaves physical actor choices intact.
-        An unreachable final target uses a command-independent safe projection;
-        its realised deviation remains explicit in the resulting water balance.
+        Bounds constrain end-of-day storage. Every decision uses the same
+        physical action mapping; episode boundaries impose no extra release
+        restrictions and storage is never overwritten.
         """
         storage, external, actions = [np.asarray(x, dtype=np.float64) for x in (storage, external, actions)]
         if any(x.shape != (5,) or not np.isfinite(x).all() for x in (storage, external, actions)):
@@ -167,7 +123,7 @@ class ReservoirPhysics:
         if ((storage < d.vmin - 1) | (storage > d.vmax + 1)).any():
             raise InfeasibleCascade("Starting storage violates operating bounds")
         dispatched = dispatch_release(storage[None], external[None], actions[None],
-            storage_min[None], storage_max[None], d.release_cap, self.dt, terminal)
+            storage_min[None], storage_max[None], d.release_cap, self.dt)
         def unbatch(value):
             if isinstance(value, dict):
                 return {key:unbatch(item) for key, item in value.items()}

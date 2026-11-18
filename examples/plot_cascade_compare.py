@@ -17,10 +17,12 @@ SCHEMA = 'cascade_comparison_v1'
 COLORS = {'happo': '#c0392b', 'mappo': '#2563eb'}
 # Serialized layout versions are kept here so plotting does not import Gym,
 # PyTorch or the simulator in a separate Matplotlib-only interpreter.
-ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_terminal_target_next7d_forecast_future_volume_v5'
+ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_next7d_forecast_v6'
+VOLUME_ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_terminal_target_next7d_forecast_future_volume_v5'
 TARGET_ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_terminal_target_next7d_forecast_v4'
 PREVIOUS_ACTOR_OBSERVATION_LAYOUT = 'local_neighbors_next_day_limits_next7d_forecast_v3'
-CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_forecasts_targets_future_volumes_v2'
+CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_v3'
+VOLUME_CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_forecasts_targets_future_volumes_v2'
 TARGET_CRITIC_STATE_LAYOUT = 'system_storage_inflow_release_limits_next7d_forecasts_terminal_targets_v1'
 FORECAST_INPUT = 'five_reservoir_next7d_mean_inflow_forecast_1965_2024.csv'
 SHARED_FIELDS = (
@@ -137,13 +139,15 @@ def _observation_dimensions(run):
     critic_layout = architecture.get('critic_state_layout')
     state_size = 38 if daily_limits else 18
     raw_dim = 15 if daily_limits else 11
-    if actor_layout in (ACTOR_OBSERVATION_LAYOUT, TARGET_ACTOR_OBSERVATION_LAYOUT):
+    if actor_layout in (ACTOR_OBSERVATION_LAYOUT, TARGET_ACTOR_OBSERVATION_LAYOUT, VOLUME_ACTOR_OBSERVATION_LAYOUT):
         if not has_forecast:
             raise ValueError('The current actor observation layout requires the inflow forecast input hash')
-        current = actor_layout == ACTOR_OBSERVATION_LAYOUT
-        raw_dim += 3 if current else 2
-        state_size += 15 if current else 10
-        if critic_layout != (CRITIC_STATE_LAYOUT if current else TARGET_CRITIC_STATE_LAYOUT):
+        extra, expected_critic = {ACTOR_OBSERVATION_LAYOUT: (1, CRITIC_STATE_LAYOUT),
+            TARGET_ACTOR_OBSERVATION_LAYOUT: (2, TARGET_CRITIC_STATE_LAYOUT),
+            VOLUME_ACTOR_OBSERVATION_LAYOUT: (3, VOLUME_CRITIC_STATE_LAYOUT)}[actor_layout]
+        raw_dim += extra
+        state_size += 5*extra
+        if critic_layout != expected_critic:
             raise ValueError('Current actor observation layout requires the matching critic state layout')
         if architecture.get('critic_state_size') != state_size:
             raise ValueError('Critic state size does not match its observation layout')

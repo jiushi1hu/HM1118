@@ -73,7 +73,7 @@ class CorrectnessWorkflowTest(unittest.TestCase):
         window = observed.periodic_evaluation_history[-1]['windows'][1]
         np.testing.assert_allclose(np.sum(evidence['series']['energy']), window['generation_MWh'])
 
-    def test_experiment_saves_reusable_evidence_and_dispatches_six_figures(self):
+    def test_experiment_saves_reusable_evidence_and_dispatches_seven_figures(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             output = Path(directory)/'correctness'
             args = SimpleNamespace(episode_log=None, no_plot=True, skip_final_evaluation=False,
@@ -84,16 +84,21 @@ class CorrectnessWorkflowTest(unittest.TestCase):
                 parallel.run_parallel_experiment(self.data, self.physical,
                                                 copy.deepcopy(self.config), args)
             payload = json.loads((output/'evidence.json').read_text())
-            self.assertEqual(payload['schema'], 'cascade_correctness_v1')
+            self.assertEqual(payload['schema'], 'cascade_correctness_v2')
+            self.assertEqual(payload['configuration']['correctness_diagnostics']['figures'],
+                ['mass_balance.png', 'water_levels.png', 'release_feasibility.png',
+                 'storage_change.png', 'reward_reconciliation.png', 'happo_updates.png',
+                 'operation_trajectories.png'])
             run = payload['runs'][0]
             self.assertEqual(run['seed'], 1)
             self.assertEqual(run['trajectory']['steps'], 3)
-            self.assertEqual(len(run['terminal_records']), 2+2*3+1)
-            self.assertEqual(run['terminal_summary']['training']['record_count'], 2)
-            self.assertEqual(run['terminal_summary']['training_evaluation']['record_count'], 6)
-            self.assertEqual({row['phase'] for row in run['terminal_records']},
+            self.assertIn('operation_trajectory', run)
+            self.assertEqual(len(run['storage_records']), 2+2*3+1)
+            self.assertEqual(run['storage_summary']['training']['record_count'], 2)
+            self.assertEqual(run['storage_summary']['training_evaluation']['record_count'], 6)
+            self.assertEqual({row['phase'] for row in run['storage_records']},
                              {'training', 'training_evaluation', 'evaluation'})
-            self.assertTrue(all(row['available'] for row in run['terminal_records']))
+            self.assertTrue(all(row['available'] for row in run['storage_records']))
             commands = [call.args[0] for call in render.call_args_list]
             self.assertEqual(commands[0], ['/plot/python', str(ROOT/'examples/plot_cascade_correctness.py'),
                                             '--check-backend'])
@@ -116,9 +121,9 @@ class CorrectnessWorkflowTest(unittest.TestCase):
             payload = json.loads((output/'evidence.json').read_text())
             self.assertEqual(payload['evaluation_failure']['seed'], 1)
             self.assertEqual(payload['runs'][0]['trajectory']['steps'], 3)
-            terminal = payload['runs'][0]['terminal_records'][-1]
-            self.assertFalse(terminal['available'])
-            self.assertEqual(terminal['status'], 'failed')
+            inventory = payload['runs'][0]['storage_records'][-1]
+            self.assertFalse(inventory['available'])
+            self.assertEqual(inventory['status'], 'failed')
 
 
 class CorrectnessCLIValidationTest(unittest.TestCase):

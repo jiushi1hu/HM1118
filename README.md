@@ -3,9 +3,9 @@
 Daily operation of the WDD, BHT, XLD, XJB and THR cascade using a specialized
 feed-forward HARL implementation. The objective combines hydropower generation
 with a soft ecological-flow penalty. Water balance, storage envelopes, outlet
-capacities are hard physical constraints. Episode-end storage equality is a
-required scheduling objective, checked separately from simulation completion;
-forecast-based dispatch does not guarantee its satisfaction under all inflows.
+capacities are hard physical constraints. Final storage is free within the
+operating bounds; initial/final inventories and net depletion are reported
+without an equality target or pass/fail test.
 
 ## Run
 
@@ -53,23 +53,11 @@ storage and level for each action date. Its row for date t constrains the state
 after action t; no extra date shift is applied. Previous executed bounds constrain
 the current state, including across source-year joins.
 
-`terminal_storage_equal_initial: true` requires every reservoir to finish the
-full episode at its own episode-start storage. Each outlet's remaining release
-budget includes all upstream storage restoration and external inflows. The
-issued next-seven-day mean supplies up to seven future days; the rest uses a
-frozen, circular 31-day-smoothed month/day climatology fitted exclusively to
-training-year external/incremental flows. Only future source dates are consulted,
-never future observed inflows or forecasts issued on future dates.
-
-These cascade-prefix release ranges enter the backward downstream-compatibility
-pass before commands are mapped to flows. If the joint forecast ranges are
-inconsistent before the last day, the plan is rejected and the actor retains its
-physically feasible command interval. This is recorded as a rejected plan,
-separately from a forced action. On the final day, a feasible joint target fixes
-the exact releases. An unreachable target uses a deterministic upstream-priority
-nearest-physical-release fallback and reports the actual deviation. Storage is
-never overwritten. Prefix budgets are necessary forecast conditions; they do not
-establish robust reachability through every future seasonal storage envelope.
+Every decision, including the last day, uses the same physical release mapping.
+There is no prescribed final water level, reserve-window override, terminal
+projection, seasonal refill budget or terminal-deviation reward. Storage is
+always calculated from executed flows. Episode boundaries still stop value
+bootstrapping; this is independent of reservoir inventory requirements.
 
 Actor observations contain local and immediate-neighbor storage, current inflow,
 yesterday's release, downstream headroom, calendar/time features and daily bounds.
@@ -77,21 +65,12 @@ The supplied `five_reservoir_next7d_mean_inflow_forecast_1965_2024.csv` contribu
 one additional local feature: the date-t forecast of next-seven-day mean inflow,
 standardized using actual-inflow statistics from training years only. Forecasts
 are read from the supplied file, including at nonconsecutive held-out year joins;
-they are not recomputed from future actual inflows. Each actor also receives its
-own episode terminal target, normalized by its operating storage range. Actors
-also receive the expected remaining external volume, normalized by mean
-training inflow times the episode duration. Actors receive 18 features with
-daily limits, or 14 without them; their final three features are target, issued
-forecast and remaining volume.
-
-The centralized critic receives all five issued forecasts, normalized terminal
-targets and remaining external volumes, in addition to system storage, current
-inflows, previous releases, time and operating bounds. Its state has 53 features
-with daily limits, or 33 without them. Target and remaining-volume features are zero when terminal scheduling is disabled,
-and targets remain tied to episode-start storage across source-year joins. These
-inputs expose scheduling context without reading future observed inflows. Actor
-and critic layouts are versioned in run and checkpoint metadata; checkpoints
-trained with earlier input layouts require their original source snapshot.
+they are not recomputed from future actual inflows. Actors receive 16 features
+with daily limits, or 12 without them; the issued forecast is the final feature.
+The centralized critic receives the five issued forecasts after the physical
+state prefix, for 43 features with daily limits or 23 without. Layout versions
+are recorded in logs/checkpoints. Earlier checkpoints require their original
+source snapshot and cannot be loaded into the reduced input layout.
 
 For categorical action k among K commands:
 
@@ -100,8 +79,8 @@ u = k / (K - 1)
 release = feasible_low + u² * (feasible_high - feasible_low)
 ```
 
-Feasible release intervals enforce storage bounds, outlet capacities,
-downstream compatibility and accepted cascade-prefix terminal ranges. Physically forced intervals
+Feasible release intervals enforce storage bounds, outlet capacities
+and downstream compatibility. Physically forced intervals
 mask actor learning and contribute a unit HAPPO correction factor. The default
 100-command grid can be changed with `--action-bins`.
 
@@ -212,9 +191,9 @@ older logs without that input retain their original dimensions.
 
 ## Correctness figures
 
-`--correctness-output NEW_DIRECTORY` enables six additional diagnostic figures
+`--correctness-output NEW_DIRECTORY` enables seven additional diagnostic figures
 and saves their numerical evidence to `NEW_DIRECTORY/evidence.json`. It works
-with `--no-plot`: these six figures are saved using a headless Matplotlib backend,
+with `--no-plot`: these seven figures are saved using a headless Matplotlib backend,
 while the standard interactive figures remain disabled. Select an interpreter
 with NumPy and Matplotlib using `--plot-python` when training uses a different
 Python environment.
@@ -225,25 +204,34 @@ python -B examples/train_cascade.py --seeds 1 2 3 \
 ```
 
 The files are `mass_balance.png`, `water_levels.png`,
-`release_feasibility.png`, `terminal_storage.png`,
-`reward_reconciliation.png`, and `happo_updates.png`.
+`release_feasibility.png`, `storage_change.png`,
+`reward_reconciliation.png`, `happo_updates.png`, and `operation_trajectories.png`.
 
 Physical traces come from the final policy's deterministic median training-only
 evaluation window, reusing the existing evaluation rather than collecting extra
 training samples. One complete window per seed is retained. Balance residuals,
 routing, physical limits and reward components are independently reconstructed
 from the raw executed storage/flow/power values. Missing or partial trajectories,
-ecological deficits, forced releases and terminal misses remain visible.
+ecological deficits, physically forced releases and inventory changes remain visible.
 
-Terminal evidence retains every collected training episode, every periodic
-evaluation round, and the held-out sequence when enabled. The terminal figure
-shows the latest batch/round with pass counts over the complete saved history,
-keeping the figure readable. Training rows identify the policy update that
-collected them, which precedes its optimizer update. Completion, physical
-feasibility, terminal equality and ecological compliance have separate fields;
-`required_constraints_met` combines physical feasibility and enabled terminal
-equality. Ecology remains soft. Raw returns are retained for completed scenarios;
-constraint-qualified periodic returns are null if any required scenario fails.
+The additional `operation_trajectories.png` combines water levels (solid lines,
+left axis) and release discharges (dashed lines, reversed right axis), with one
+reservoir per row and one seed per column. Its horizontal axis covers exactly
+five complete calendar years from the selected median training-only window,
+including leap days. A separate deterministic final-policy replay covers the
+complete calendar interval; the existing fixed-day diagnostics and training
+episode lengths are unchanged. Filled markers and numeric labels show the
+end-of-day water level on December 31 of each annual segment. Gray shading
+identifies June through September, and vertical separators mark annual
+boundaries. The replay is observational and does not update the policy.
+
+Storage evidence retains the initial/final inventories of every collected
+training episode, every periodic evaluation round, and the held-out sequence.
+The storage-change figure displays the latest batch/round while reporting
+all-history inventory counts. Positive values indicate accumulation and negative
+values indicate depletion; neither is labeled a constraint violation. Completion
+and physical feasibility are separate from soft ecological compliance.
+`required_constraints_met` refers only to completed physical operation.
 HAPPO evidence spans every update: the actor-entry factor is checked
 against a separate float64 sum of categorical log-likelihood changes, with forced
 commands contributing a unit ratio. Factor errors, final likelihood ratios, KL,
@@ -287,12 +275,12 @@ python -B examples/replay_cascade_checkpoint.py \
 
 `--override-action DAY RESERVOIR INDEX` changes one command; later commands react
 through the saved policy. Replay preserves the saved horizon, physical and data
-hashes, forecast layout and terminal semantics. It reports generation, ecological
+hashes, forecast layout and physical dispatch semantics. It reports generation, ecological
 deficits, learning returns, spill and final storage without fitting models.
 
 `analysis/dispatch_diagnostics/` reconstructs frozen trajectories and tests
 same-state ecological release alternatives through the full cascade. Grid and
-continuous witnesses retain terminal scheduling inputs. These are separate same-day
+continuous witnesses retain physical bounds and the other sampled commands. These are separate same-day
 comparisons, not an executable multi-day intervention or evidence of optimality.
 
 ## Source map

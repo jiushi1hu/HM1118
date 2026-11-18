@@ -19,7 +19,7 @@ each selected seed. Replayed energy, returns and ecological violation counts
 must reproduce the original run log. For each violated reservoir, all configured
 commands are tested with other commands held fixed. Continuous release bounds
 identify the minimum release meeting the threshold and the maximum attainable
-release. Full-cascade witnesses preserve daily envelopes and the rolling terminal
+release. Full-cascade witnesses preserve daily envelopes and the physical
 scheduling window. Generation, power and head remain ordinary physical metadata.
 
 ## Outputs

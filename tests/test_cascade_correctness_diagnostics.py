@@ -42,7 +42,7 @@ def golden_transition():
         anchors={name: np.array([[0., 0.], [100., 864000000.]]) for name in IDS},
         service_requirements=SimpleNamespace(ecological_flow_m3s=np.array([10., 20., 0., 40., 50.])))
     physical = dict(timestep_seconds=86400., efficiency=.9, water_density_kg_m3=1000.,
-        gravity_m_s2=9.81, head_model='fixed', terminal_storage_equal_initial=False,
+        gravity_m_s2=9.81, head_model='fixed',
         reward_penalties=dict(enabled=True, ecological_flow_weight=1.))
     return data, physical, row
 
@@ -75,7 +75,8 @@ class CascadeCorrectnessDiagnosticsTest(unittest.TestCase):
         self.assertEqual(result['summary']['ecological_violation_rate'], 1.)
         # Ecological deficits are soft events, not failures of hard dispatch.
         self.assertEqual(result['summary']['violation_counts']['ecological'], 4)
-        self.assertFalse(result['terminal']['enabled'])
+        self.assertEqual(result['storage']['storage_change_m3'], [0.]*5)
+        self.assertEqual(result['storage']['net_storage_change_m3'], 0.)
         json.dumps(result, allow_nan=False)
 
     def test_corrupted_storage_inflow_and_reward_are_exposed_without_repair(self):
@@ -128,29 +129,34 @@ class CascadeCorrectnessDiagnosticsTest(unittest.TestCase):
                     self.assertEqual(result['summary']['reward_mismatch_days'], 0)
                     self.assertEqual(result['summary']['violation_counts']['generation_calculation'], 0)
                     self.assertEqual(result['summary']['violation_counts']['level_lookup'], 0)
-                    np.testing.assert_array_equal(result['physical']['target_storage_m3'], storage)
-                    self.assertEqual(result['terminal']['met'], env.terminal_report['met'])
-                    self.assertEqual(result['terminal']['reported'], env.terminal_report)
-                    self.assertTrue(result['terminal']['at_episode_end'])
+                    np.testing.assert_array_equal(result['storage']['initial_storage_m3'], storage)
+                    np.testing.assert_array_equal(result['storage']['final_storage_m3'], env.storage)
+                    np.testing.assert_array_equal(result['storage']['storage_change_m3'], env.storage-storage)
+                    self.assertNotIn('met', result['storage'])
                     json.dumps(result, allow_nan=False)
 
-    def test_forced_terminal_miss_is_reported_separately_from_hard_physical_failures(self):
+    def test_final_day_inventory_change_is_neutral_and_preserves_physical_control(self):
         physical = dict(self.physical, use_daily_level_limits=False)
         data = CascadeData(ROOT/'data/cascade_reservoir_new', physical)
         env = episode_environment(data, physical, [1965], days=1, action_bins=11)
-        env.storage[0] = data.vmin[0]
+        initial = env.storage.copy()
         env.step(np.full(5, 10))
+        longer = episode_environment(data, physical, [1965], days=2, action_bins=11)
+        longer.step(np.full(5, 10))
         recorder = CorrectnessRecorder(data, physical, 1, max_steps=1)
         recorder.begin_episode(1, [1965])
         recorder.capture(env.last_transition)
         result = recorder.finish()
-        self.assertFalse(result['terminal']['met'])
-        self.assertGreater(result['summary']['violation_counts']['terminal_window_infeasible'], 0)
-        self.assertGreater(result['summary']['violation_counts']['forced'], 0)
         self.assertEqual(result['summary']['hard_physical_reservoir_days'], 0)
-        np.testing.assert_array_equal(result['physical']['initial_storage_m3'], env.last_transition['storage_start'])
-        np.testing.assert_array_equal(result['physical']['target_storage_m3'], env.last_transition['terminal_target'])
-        np.testing.assert_array_equal(result['terminal']['deviation_m3'], env.storage-env.initial_storage)
+        self.assertTrue(np.any(env.storage != initial))
+        for field in ('release', 'storage_end', 'controls', 'low', 'high'):
+            np.testing.assert_array_equal(env.last_transition[field], longer.last_transition[field])
+        np.testing.assert_array_equal(result['storage']['initial_storage_m3'], initial)
+        np.testing.assert_array_equal(result['storage']['final_storage_m3'], env.storage)
+        np.testing.assert_array_equal(result['storage']['storage_change_m3'], env.storage-initial)
+        self.assertAlmostEqual(result['storage']['total_storage_depletion_m3'], float((initial-env.storage).sum()))
+        self.assertNotIn('met', result['storage'])
+        self.assertNotIn('tolerance_m3', result['storage'])
 
     def test_bounded_replacement_and_detached_json_outputs(self):
         data, physical, row = golden_transition()
@@ -173,23 +179,21 @@ class CascadeCorrectnessDiagnosticsTest(unittest.TestCase):
 
     def test_unavailable_and_partial_evidence_is_json_compatible(self):
         data, physical, row = golden_transition()
-        physical = dict(physical, terminal_storage_equal_initial=True)
         recorder = CorrectnessRecorder(data, physical, 0, max_steps=4)
         recorder.begin_episode(1, [2001])
         result = recorder.finish()
         self.assertEqual(result['steps'], 0)
         self.assertEqual(result['series'], {})
-        self.assertIsNone(result['terminal']['met'])
+        self.assertIsNone(result['storage']['final_storage_m3'])
+        self.assertIsNone(result['storage']['storage_change_m3'])
         self.assertIsNone(result['summary']['max_abs_reward_difference'])
         json.dumps(result, allow_nan=False)
         recorder.begin_episode(1, [2001])
-        row['terminal_target'] = row['storage_start'].copy()
-        row['terminal_remaining_days'] = 4
         recorder.capture(row)
         partial = recorder.finish()
         self.assertEqual(partial['steps'], 1)
-        self.assertFalse(partial['terminal']['at_episode_end'])
-        self.assertIsNone(partial['terminal']['met'])
+        np.testing.assert_array_equal(partial['storage']['final_storage_m3'], row['storage_end'])
+        np.testing.assert_array_equal(partial['storage']['storage_change_m3'], np.zeros(5))
         json.dumps(partial, allow_nan=False)
 
     def test_disabled_services_and_zero_thresholds_have_no_division_or_fake_events(self):

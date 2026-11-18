@@ -19,8 +19,7 @@ from test_dispatch_feasibility import synthetic_dispatch
 
 
 class BatchedPhysicsTest(unittest.TestCase):
-    def assert_scalar_equivalent(self, physics, storage, external, actions, lower=None, upper=None,
-                                 terminal=None):
+    def assert_scalar_equivalent(self, physics, storage, external, actions, lower=None, upper=None):
         storage, external, actions = [np.asarray(value, dtype=np.float64)
                                       for value in (storage, external, actions)]
         copies = [value.copy() for value in (storage, external, actions)]
@@ -31,24 +30,12 @@ class BatchedPhysicsTest(unittest.TestCase):
             lower.setflags(write=False)
             upper.setflags(write=False)
         rng = np.random.get_state()
-        options = {} if terminal is None else dict(terminal=terminal)
-        actual = batched_transition(physics, storage, external, actions, lower, upper, **options)
+        actual = batched_transition(physics, storage, external, actions, lower, upper)
         expected = []
         for i in range(len(storage)):
             bounds = {} if lower is None else dict(
                 storage_lower=lower if lower.ndim == 1 else lower[i],
                 storage_upper=upper if upper.ndim == 1 else upper[i])
-            if terminal is not None:
-                bounds['terminal'] = dict(
-                    target=terminal['target'] if np.ndim(terminal['target']) == 1 else terminal['target'][i],
-                    remaining_days=(terminal['remaining_days'] if np.ndim(terminal['remaining_days']) == 0
-                                    else terminal['remaining_days'][i]),
-                    forecast=(terminal['forecast'] if np.ndim(terminal['forecast']) == 1
-                              else terminal['forecast'][i]))
-                if 'future_external_volume_m3' in terminal:
-                    volume = terminal['future_external_volume_m3']
-                    bounds['terminal']['future_external_volume_m3'] = (
-                        volume if np.ndim(volume) == 1 else volume[i])
             expected.append(physics.transition(storage[i], external[i], actions[i], **bounds))
         self.assertEqual(set(actual), set(expected[0]))
         for name in actual:
@@ -56,13 +43,8 @@ class BatchedPhysicsTest(unittest.TestCase):
             # equality rather than an engineering tolerance that could hide a
             # capacity, endpoint or routing discrepancy.
             with self.subTest(field=name):
-                if name == 'terminal':
-                    for key in actual[name]:
-                        np.testing.assert_array_equal(actual[name][key],
-                            np.asarray([row[name][key] for row in expected]))
-                else:
-                    np.testing.assert_array_equal(actual[name],
-                        np.asarray([row[name] for row in expected]))
+                np.testing.assert_array_equal(actual[name],
+                    np.asarray([row[name] for row in expected]))
         for original, unchanged in zip((storage, external, actions), copies):
             np.testing.assert_array_equal(original, unchanged)
         after = np.random.get_state()
@@ -88,16 +70,9 @@ class BatchedPhysicsTest(unittest.TestCase):
                     candidates[i*100:(i+1)*100, i] = grid
                 arrays = [np.repeat(row[name][None], 500, axis=0)
                           for name in ('storage_start', 'external', 'storage_lower_m3', 'storage_upper_m3')]
-                terminal = None
-                if row.get('terminal_target') is not None:
-                    terminal = dict(target=np.repeat(row['terminal_target'][None], 500, axis=0),
-                        remaining_days=np.full(500, row['terminal_remaining_days'], dtype=np.int64),
-                        forecast=np.repeat(row['terminal_forecast'][None], 500, axis=0),
-                        future_external_volume_m3=np.repeat(
-                            row['terminal_future_external_volume_m3'][None], 500, axis=0))
                 with self.subTest(head=head_model, date=row['date']):
                     self.assert_scalar_equivalent(env.physics, arrays[0], arrays[1], candidates,
-                                                  arrays[2], arrays[3], terminal)
+                                                  arrays[2], arrays[3])
 
     def test_forced_intervals_and_downstream_control_changes(self):
         for head_model in ('fixed', 'storage_sensitivity'):
@@ -133,60 +108,20 @@ class BatchedPhysicsTest(unittest.TestCase):
             self.assertEqual(actual['release'][0,0], 0.)
             self.assertEqual(actual['controls'][0,0], 0.)
 
-    def test_explicit_future_volume_changes_prefix_budget_and_broadcasts(self):
-        env, row = synthetic_dispatch()
-        storage = np.repeat(row['storage_start'][None], 2, axis=0)
-        volume = np.array([[0.]*5, [1000.*env.physics.dt]*5])
-        terminal = dict(target=row['storage_start'], remaining_days=2,
-                        forecast=np.full(5, 1000.), future_external_volume_m3=volume)
-        result = self.assert_scalar_equivalent(env.physics, storage, np.zeros((2, 5)),
-                                               np.ones((2, 5)), terminal=terminal)
-        np.testing.assert_array_equal(result['terminal_future_external_volume_m3'], volume)
-        np.testing.assert_array_equal(result['terminal']['future_external_volume_m3'], volume)
-        np.testing.assert_allclose(result['release'][0], np.zeros(5), atol=1e-8)
-        self.assertTrue(np.any(result['release'][1] > result['release'][0]))
-
-    def test_rejected_nonfinal_terminal_plan_keeps_physical_command_control(self):
+    def test_distinct_commands_retain_physical_control_and_free_end_storage(self):
         for head in ('fixed', 'storage_sensitivity'):
             with self.subTest(head=head):
                 env, row = synthetic_dispatch(head_model=head)
                 start = row['storage_start']
-                target = start.copy()
-                # No future upstream inflow can refill this extra target volume.
-                target[0] += 100.*env.physics.dt
-                terminal = dict(target=target, remaining_days=2, forecast=np.zeros(5),
-                                future_external_volume_m3=np.zeros(5))
                 result = self.assert_scalar_equivalent(env.physics,
                     np.repeat(start[None], 2, axis=0), np.zeros((2, 5)),
-                    np.array([[0.]*5, [1.]*5]), terminal=terminal)
-                np.testing.assert_array_equal(result['terminal_plan_rejected'], [True, True])
-                np.testing.assert_array_equal(result['terminal_fallback'], [False, False])
-                physical = batched_transition(env.physics, np.repeat(start[None], 2, axis=0),
-                                              np.zeros((2, 5)), np.array([[0.]*5, [1.]*5]))
-                np.testing.assert_array_equal(result['controls'], physical['controls'])
-                np.testing.assert_array_equal(result['actions'], physical['actions'])
-                np.testing.assert_array_equal(result['release'], physical['release'])
+                    np.array([[0.]*5, [1.]*5]))
                 np.testing.assert_array_equal(result['controls'][:, 0], np.ones(2))
-                self.assertTrue(np.any(result['release'][0] != result['release'][1]))
-
-    def test_unreachable_final_target_uses_same_command_independent_physical_fallback(self):
-        for head in ('fixed', 'storage_sensitivity'):
-            with self.subTest(head=head):
-                env, row = synthetic_dispatch(head_model=head)
-                start = row['storage_start']
-                target = start.copy()
-                target[0] += 100.*env.physics.dt
-                terminal = dict(target=target, remaining_days=1, forecast=np.zeros(5),
-                                future_external_volume_m3=np.zeros(5))
-                result = self.assert_scalar_equivalent(env.physics,
-                    np.repeat(start[None], 2, axis=0), np.zeros((2, 5)),
-                    np.array([[0.]*5, [1.]*5]), terminal=terminal)
-                np.testing.assert_array_equal(result['terminal_fallback'], [True, True])
-                np.testing.assert_array_equal(result['controls'], np.zeros((2, 5)))
-                np.testing.assert_array_equal(result['release'][0], result['release'][1])
+                self.assertNotEqual(result['release'][0, 0], result['release'][1, 0])
                 self.assertTrue(np.all(result['storage_end'] >= env.data.vmin))
                 self.assertTrue(np.all(result['storage_end'] <= env.data.vmax))
-                self.assertTrue(np.any(result['storage_end'][0] != target))
+                self.assertTrue(np.any(result['storage_end'][1] != start))
+                self.assertFalse(any(name.startswith('terminal') for name in result))
 
     def test_invalid_rows_and_bounds_fail_without_mutation(self):
         env, row = synthetic_dispatch()

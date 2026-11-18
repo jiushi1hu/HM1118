@@ -13,6 +13,7 @@ from harl.envs.cascade_reservoir.training_metrics import log_episode, StepMetric
 from harl.envs.cascade_reservoir.training_sampler import TrainingWindowSampler, validate_sampling_mode
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.evaluation import episode_constraint_status
+from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 from harl.envs.cascade_reservoir.trajectory_diagnostics import (
     TrajectoryDiagnosticsWriter, TRAJECTORY_DIAGNOSTIC_FIELDS)
 from harl.runners.cascade_reservoir_runner import (
@@ -23,7 +24,8 @@ from harl.envs.cascade_reservoir.cascade_reservoir_env import (
 
 ROOT=Path(__file__).resolve().parents[1]
 CORRECTNESS_FIGURES = ('mass_balance', 'water_levels', 'release_feasibility',
-                       'terminal_storage', 'reward_reconciliation', 'happo_updates')
+                       'storage_change', 'reward_reconciliation', 'happo_updates',
+                       'operation_trajectories')
 
 
 def validate_correctness_output(directory, other_paths=()):
@@ -40,79 +42,61 @@ def validate_correctness_output(directory, other_paths=()):
 
 
 def build_correctness_payload(runners, metadata, evaluations, evaluation_failure=None):
-    """Retain final-policy physical evidence and all update-level HAPPO checks."""
+    """Retain physical evidence, neutral endpoint inventories and HAPPO checks."""
     runs = []
-    enabled = bool(metadata['physical_config'].get('terminal_storage_equal_initial', False))
     for runner in runners:
-        terminal_records = []
-        def terminal_record(row, phase, scenario_id, policy_update=None):
-            terminal = row.get('terminal_objective')
+        records = []
+        def storage_record(row, phase, scenario_id, policy_update=None):
             completed = bool(row.get('completed', True)) and row.get('status') not in (
                 'failed', 'not_evaluated', 'unavailable')
-            available = enabled and completed and isinstance(terminal, dict)
-            physical = row.get('physical_feasible',
-                               bool(completed and not row.get('hard_constraint_failed', False)))
+            years = row.get('source_years', [])
+            initial = row.get('initial_storage_m3')
+            if initial is None and years:
+                initial = runner.data.initial_storage(years[0])
+            final = row.get('final_storage_m3') if completed else None
+            available = initial is not None and final is not None
             record = dict(phase=phase, scenario_id=scenario_id,
                 policy_update=runner.update_count if policy_update is None else policy_update,
-                source_years=row.get('source_years', []),
-                enabled=enabled, available=available,
+                source_years=years, available=available,
                 status='ok' if completed else row.get('status', 'unavailable'))
-            record.update(episode_constraint_status(completed=completed, physical_feasible=physical,
-                terminal_enabled=enabled, terminal_objective=terminal,
+            record.update(episode_constraint_status(completed=completed,
+                physical_feasible=row.get('physical_feasible',
+                    bool(completed and not row.get('hard_constraint_failed', False))),
                 service_shortfalls=row.get('service_shortfalls')))
-            if available:
-                record.update({name:terminal[name] for name in
-                    ('target_m3', 'final_storage_m3', 'deviation_m3', 'tolerance_m3', 'met')})
-                # Use the saved raw endpoints as a separate terminal reference;
-                # retain the simulator's report so disagreements stay auditable.
-                deviation = [float(end)-float(target) for end, target in
-                             zip(terminal['final_storage_m3'], terminal['target_m3'])]
-                tolerance = [max(1e-3, 1e-10*abs(float(target))) for target in terminal['target_m3']]
-                record.update(reported_deviation_m3=terminal['deviation_m3'],
-                    reported_tolerance_m3=terminal['tolerance_m3'], reported_met=terminal['met'],
-                    deviation_m3=deviation, tolerance_m3=tolerance,
-                    met=all(abs(error) <= bound for error, bound in zip(deviation, tolerance)),
-                    report_max_abs_error_m3=max(abs(float(actual)-expected) for actual, expected in
-                                                zip(terminal['deviation_m3'], deviation)))
-                record['reported_status_consistent'] = record['met'] == record['reported_met']
-                record.update(episode_constraint_status(completed=completed, physical_feasible=physical,
-                    terminal_enabled=enabled, terminal_objective={'met':record['met']},
-                    service_shortfalls=row.get('service_shortfalls')))
-            terminal_records.append(record)
+            if initial is not None:
+                record.update(storage_change_summary(initial, final if available else None))
+            records.append(record)
         for row in runner.episode_history:
-            terminal_record(row, 'training', 'collection_episode_'+str(row['episode']),
-                            row['policy_updates_completed'])
+            storage_record(row, 'training', 'collection_episode_'+str(row['episode']),
+                           row['policy_updates_completed'])
         for periodic in runner.periodic_evaluation_history:
             for window in periodic['windows']:
-                terminal_record(window, 'training_evaluation', window['window_id'],
-                                periodic['evaluation_round'])
+                storage_record(window, 'training_evaluation', window['window_id'],
+                               periodic['evaluation_round'])
         for row in evaluations:
             if row['seed'] == runner.seed:
-                terminal_record(row, 'evaluation', 'held_out_sequence')
+                storage_record(row, 'evaluation', 'held_out_sequence')
         if evaluation_failure is not None and not any(row['seed'] == runner.seed for row in evaluations):
-            terminal_record(dict(source_years=list(runner.data.evaluation_years),
-                                 completed=False, status='not_evaluated'),
-                            'evaluation', 'held_out_sequence')
-            terminal_records[-1]['status'] = ('failed' if runner.seed == evaluation_failure['seed']
-                                             else 'not_evaluated')
+            storage_record(dict(source_years=list(runner.data.evaluation_years),
+                                completed=False, status='not_evaluated'),
+                           'evaluation', 'held_out_sequence')
+            records[-1]['status'] = ('failed' if runner.seed == evaluation_failure['seed']
+                                     else 'not_evaluated')
         runs.append(dict(seed=runner.seed, trajectory=runner.correctness_trajectory,
-            terminal_records=terminal_records,
-            terminal_summary={phase:dict(record_count=len(rows),
+            operation_trajectory=getattr(runner, 'operation_trajectory', None),
+            storage_records=records,
+            storage_summary={phase:dict(record_count=len(rows),
                 completed_count=sum(row['completed'] for row in rows),
-                enabled_count=sum(row['enabled'] for row in rows),
-                measured_count=sum(row['available'] for row in rows),
-                terminal_pass_count=sum(row.get('terminal_met') is True for row in rows),
-                terminal_miss_count=sum(row.get('terminal_met') is False for row in rows),
-                required_pass_count=sum(row.get('required_constraints_met') is True for row in rows))
+                measured_count=sum(row['available'] for row in rows))
                 for phase in ('training', 'training_evaluation', 'evaluation')
-                for rows in [[row for row in terminal_records if row['phase'] == phase]]},
+                for rows in [[row for row in records if row['phase'] == phase]]},
             update_records=runner.correctness_update_history))
-    return dict(schema='cascade_correctness_v1', configuration=metadata, runs=runs,
+    return dict(schema='cascade_correctness_v2', configuration=metadata, runs=runs,
         evaluation_failure=evaluation_failure,
-        interpretation='Independent numerical consistency checks of the recorded implementation; '
-            'not a proof of hydraulic calibration, optimality or terminal feasibility',
+        interpretation='Independent numerical consistency checks; endpoint storage changes are inventory accounting, not constraint violations',
         trajectory_scope='deterministic final-policy median training-only evaluation scenario per seed',
-        terminal_scope='all collected episodes, every periodic evaluation round including round zero, and optional held-out sequence; compact endpoints only',
+        operation_scope='deterministic final-policy operation over five complete calendar years from the selected median training-only window; leap days retained',
+        storage_scope='all collected episodes, every periodic round and optional held-out sequence; compact initial/final inventories',
         update_scope='all training updates; bounded summaries, no additional optimizer steps')
 
 
@@ -129,7 +113,7 @@ def save_correctness_outputs(runners, metadata, evaluations, directory, plot_pyt
         '--input',str(evidence_path),'--output-dir',str(directory),'--no-show'],check=True,
         stdout=None if metadata.get('config', {}).get('experiment', {}).get('verbose_console', False)
                     else subprocess.DEVNULL)
-    print('Correctness evidence and six figures saved to '+str(directory.resolve()),flush=True)
+    print('Correctness evidence and seven figures saved to '+str(directory.resolve()),flush=True)
 
 
 def step_metrics_paths(episode_log, seeds):
@@ -195,7 +179,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     correctness_dir = getattr(args, 'correctness_output', None)
     correctness_enabled = correctness_dir is not None
     if correctness_enabled and getattr(runner_cls, 'algorithm_name', 'happo') != 'happo':
-        raise ValueError('The six correctness figures require HAPPO; select --algorithms happo')
+        raise ValueError('The seven correctness figures require HAPPO; select --algorithms happo')
     days=positive_integer(config['train']['episode_length'],'episode_days')
     count=positive_integer(config['train']['n_rollout_threads'],'parallel_envs')
     episodes=positive_integer(config['experiment']['episodes'],'episodes')
@@ -344,10 +328,8 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             schedule='final completed update and every N updates if interval is positive',
             purpose='deterministic evaluation replay; training resume is not implemented'),
         calendar='fixed consecutive daily steps with leap days retained; storage carries across source-year boundaries',
-        release_bounds_scope=('cascade_prefix_seasonal_reserve_v2' if physical.get(
-            'terminal_storage_equal_initial', False) else 'current_transition'),
-        terminal_storage_requirement=('episode-start equality is checked after the final decision; dispatcher reserve feasibility and physical completion are reported separately'
-            if physical.get('terminal_storage_equal_initial', False) else 'disabled'),
+        release_bounds_scope='current_transition',
+        end_storage_policy='unconstrained_within_daily_operating_bounds',
         daily_bound_alignment='action_date=t constrains the state after action t; no additional date shift',
         step_logging=dict(enabled=args.episode_log is not None,
             format='compact_csv_v1',
@@ -375,8 +357,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             output_directory=str(Path(correctness_dir).resolve()),
             evidence_file='evidence.json', figures=[name+'.png' for name in CORRECTNESS_FIGURES],
             physical_scope='one final-policy deterministic median training window per seed',
+            operation_scope='five complete calendar years from the selected median training-only window; deterministic final policy, leap days retained',
             update_scope='all HAPPO updates; independent float64 prefix-likelihood checks',
-            terminal_scope='all collected episode endpoints, all periodic rounds including round zero, and optional held-out sequence')
+            storage_scope='all collected episode inventories, all periodic rounds including round zero, and optional held-out sequence')
     if credit_mode == 'counterfactual':
         learning_objective.update(advantage_source='counterfactual_shared_team',
             normalization='common_controllable_rms_without_centering')

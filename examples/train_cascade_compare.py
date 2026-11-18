@@ -56,7 +56,7 @@ def comparison_preflight(args, config):
     """Check every requested output and unsupported setting before any training."""
     algorithms = validate_algorithms(args.algorithms)
     if getattr(args, 'correctness_output', None) is not None and 'mappo' in algorithms:
-        raise ValueError('The six correctness figures require HAPPO; select --algorithms happo')
+        raise ValueError('The seven correctness figures require HAPPO; select --algorithms happo')
     counterfactual = config['algo'].get('happo_credit_assignment','team_gae') == 'counterfactual'
     if counterfactual and 'mappo' in algorithms:
         raise ValueError('Counterfactual credit is a HAPPO-only variant; select --algorithms happo')

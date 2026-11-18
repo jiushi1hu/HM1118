@@ -2,8 +2,8 @@
 
 The live environment still uses ``ReservoirPhysics.transition``. This kernel
 adds only a leading batch dimension and never advances an environment or
-changes its inputs. The joint terminal prefix budget, forward execution, generation
-formulas and numerical tolerances match the scalar implementation.
+changes its inputs. Physical feasibility, forward execution, generation formulas
+and numerical tolerances match the scalar implementation.
 """
 import numpy as np
 
@@ -55,17 +55,16 @@ def _forebay_levels(physics, storage):
 
 
 def batched_transition(physics, storage, external, actions,
-                       storage_lower=None, storage_upper=None, terminal=None):
+                       storage_lower=None, storage_upper=None):
     """Evaluate normalized-command transitions with input shape ``(batch, 5)``.
 
     Optional end-state bounds have that shape or are broadcast five-vectors.
     Result vectors have shape ``(batch, 5)``; generation rewards and cascade
     residuals have shape ``(batch,)``. A failed row raises for the entire batch.
     Empty batches are allowed. As in scalar physics, the returned ``reward`` is
-    unpenalized generation; the caller applies operation-reward settings. The
-    optional terminal scheduling inputs are broadcast over the batch. Release
-    feasibility and terminal prefix budgets use the exact shared scalar kernel;
-    generation remains vectorized here.
+    unpenalized generation; the caller applies operation-reward settings.
+    Release feasibility uses the exact shared scalar kernel; generation remains
+    vectorized here.
     """
     storage = _matrix(storage, 'Storage')
     shape = storage.shape
@@ -78,7 +77,7 @@ def batched_transition(physics, storage, external, actions,
     if ((storage < data.vmin-1.) | (storage > data.vmax+1.)).any():
         raise InfeasibleCascade('Starting storage violates operating bounds')
     dispatch = dispatch_release(storage, external, actions, storage_min, storage_max,
-                                data.release_cap, dt, terminal=terminal)
+                                data.release_cap, dt)
     inflow, release = dispatch['inflow'], dispatch['release']
     next_storage = storage+(inflow-release)*dt
     residual = next_storage-storage-(inflow-release)*dt

@@ -9,9 +9,10 @@ import copy
 import numpy as np
 
 from harl.envs.cascade_reservoir.data_loader import IDS
+from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BALANCE_RELATIVE_TOLERANCE = 64.*np.finfo(np.float64).eps
 REWARD_ABSOLUTE_TOLERANCE = 1e-10
 REWARD_RELATIVE_TOLERANCE = 1e-10
@@ -27,10 +28,7 @@ _VECTOR_REWARDS = ('local_generation_rewards', 'local_reward_penalties', 'local_
 _OPTIONAL_VECTORS = (
     'storage_lower_m3', 'storage_upper_m3', 'next_state_level_lower_m',
     'next_state_level_upper_m', 'sampled_actions', 'actions', 'normalized_actions',
-    'terminal_target', 'terminal_forecast', 'terminal_window_low_m3s',
-    'terminal_window_high_m3s', 'terminal_window_binding',
-    'terminal_window_infeasible', 'terminal_window_reason',
-    'terminal_future_external_volume_m3', 'physical_low_m3s', 'physical_high_m3s',
+    'physical_low_m3s', 'physical_high_m3s',
 )
 
 
@@ -125,8 +123,6 @@ class CorrectnessRecorder:
         if not self.source_years:
             raise ValueError('An episode requires source years')
         initial = _vector(self.data.initial_storage(self.source_years[0]), 'initial storage')
-        terminal = bool(self.config.get('terminal_storage_equal_initial', False))
-        self.target = initial if terminal else None
         self.physical = dict(timestep_seconds=self.dt,
             head_model=self.config.get('head_model', 'fixed'),
             efficiency=float(self.config['efficiency']),
@@ -135,10 +131,8 @@ class CorrectnessRecorder:
             storage_max_m3=self.vmax.copy(), ecological_flow_m3s=self.ecology.copy(),
             service_requirements_available=self.services_available,
             reward_penalties_enabled=self.penalties_enabled, ecological_flow_weight=self.weight,
-            local_global_alpha=.5, terminal_storage_equal_initial=terminal,
+            local_global_alpha=.5, end_storage_policy='unconstrained_within_daily_operating_bounds',
             initial_storage_m3=initial.copy(), initial_level_m=self._levels(initial),
-            target_storage_m3=None if self.target is None else self.target.copy(),
-            target_level_m=None if self.target is None else self._levels(self.target),
             balance_accumulator_dtype=str(np.dtype(np.longdouble)),
             balance_relative_tolerance=BALANCE_RELATIVE_TOLERANCE,
             reward_absolute_tolerance=REWARD_ABSOLUTE_TOLERANCE,
@@ -147,7 +141,6 @@ class CorrectnessRecorder:
             'storage: max(1 m3, 1e-10*abs(start storage)); release: at least 1e-8 m3/s; '
             'installed power: at least 1e-7 MW; independent conservation uses separate 64-epsilon tolerances')
         self.rows, self.checks, self.differences, self.flags = [], [], [], []
-        self.reported_terminal = None
         self.started, self.closed = True, False
         self.result = None
 
@@ -182,19 +175,9 @@ class CorrectnessRecorder:
             row[name] = _scalar(transition.get(name, default), name)
         for name in _OPTIONAL_VECTORS:
             row[name] = None if name not in transition else _vector(transition[name], name)
-        row['terminal_remaining_days'] = (None if 'terminal_remaining_days' not in transition else
-                                          _scalar(transition['terminal_remaining_days'], 'remaining days'))
-        row['terminal_plan_rejected'] = bool(transition.get('terminal_plan_rejected', False))
-        row['terminal_fallback'] = bool(transition.get('terminal_fallback', False))
         if not self.rows:
-            self.physical['terminal_forecast_assumption'] = transition.get('terminal_forecast_assumption')
-            self.physical['terminal_dispatch_mechanism'] = transition.get('terminal_mechanism')
             self.physical['initial_storage_m3'] = row['storage_start'].copy()
             self.physical['initial_level_m'] = self._levels(row['storage_start'])
-            if self.target is not None and row['terminal_target'] is not None:
-                self.target = row['terminal_target'].copy()
-                self.physical['target_storage_m3'] = self.target.copy()
-                self.physical['target_level_m'] = self._levels(self.target)
         start, end = [row[name].astype(np.longdouble) for name in ('storage_start', 'storage_end')]
         inflow, release, external = [row[name].astype(np.longdouble) for name in ('inflow', 'release', 'external')]
         dt = np.longdouble(self.dt)
@@ -257,14 +240,10 @@ class CorrectnessRecorder:
             level_lookup=((np.abs(row['levels_start']-levels_start) > 1e-9) |
                           (np.abs(row['levels_end']-levels_end) > 1e-9)),
             ecological=rewards['ecological_shortfall_m3s'] > 0.,
-            forced=row['controls'] <= 0.,
-            terminal_window_infeasible=(np.zeros(5, dtype=bool) if row['terminal_window_infeasible'] is None else
-                                        row['terminal_window_infeasible'] > 0.))
+            forced=row['controls'] <= 0.)
         hard_names = ('mass_balance', 'inflow_routing', 'storage_continuity', 'storage_bounds',
                       'release_bounds', 'power_capacity', 'turbine_capacity', 'spill_partition')
         flags['hard_physical'] = np.logical_or.reduce([flags[name] for name in hard_names])
-        flags['terminal_plan_rejected'] = row['terminal_plan_rejected']
-        flags['terminal_fallback'] = row['terminal_fallback']
         reward_flags = {name: np.abs(differences[name]) >
             REWARD_ABSOLUTE_TOLERANCE+REWARD_RELATIVE_TOLERANCE*np.abs(rewards[name])
             for name in differences}
@@ -278,8 +257,6 @@ class CorrectnessRecorder:
         self.checks.append(checks)
         self.differences.append(differences)
         self.flags.append(flags)
-        if 'terminal_report' in transition:
-            self.reported_terminal = copy.deepcopy(transition['terminal_report'])
 
     def finish(self):
         if not self.started:
@@ -290,17 +267,8 @@ class CorrectnessRecorder:
         flags = stack(self.flags)
         counts = {key: int(np.count_nonzero(value)) for key, value in flags.items()}
         active_days = len(self.rows)*int(np.count_nonzero(self.ecology > 0.))
-        at_end = bool(self.rows and (self.reported_terminal is not None or
-                      self.rows[-1]['terminal_remaining_days'] == 1))
-        terminal = dict(enabled=self.target is not None, reported=self.reported_terminal,
-                        at_episode_end=at_end, met=None)
-        if self.target is not None and self.rows:
-            deviation = self.rows[-1]['storage_end']-self.target
-            tolerance = np.maximum(1e-3, 1e-10*np.abs(self.target))
-            terminal.update(target_storage_m3=self.target, final_storage_m3=self.rows[-1]['storage_end'],
-                target_level_m=self._levels(self.target), final_level_m=self.rows[-1]['levels_end'],
-                deviation_m3=deviation, tolerance_m3=tolerance,
-                met=bool((np.abs(deviation) <= tolerance).all()) if at_end else None)
+        inventory = storage_change_summary(self.physical['initial_storage_m3'],
+            self.rows[-1]['storage_end'] if self.rows else None)
         result = dict(schema_version=SCHEMA_VERSION, record_type='selected_episode_correctness',
             seed=self.seed, episode=self.episode, source_years=self.source_years,
             reservoir_ids=list(IDS), steps=len(self.rows), max_steps=self.max_steps,
@@ -313,9 +281,9 @@ class CorrectnessRecorder:
                 active_ecological_reservoir_days=active_days,
                 ecological_violation_rate=counts.get('ecological', 0)/active_days if active_days else None,
                 hard_physical_reservoir_days=counts.get('hard_physical', 0),
-                reward_mismatch_days=counts.get('reward_mismatch', 0)), terminal=terminal,
+                reward_mismatch_days=counts.get('reward_mismatch', 0)), storage=inventory,
             interpretation='Independent numerical checks of one executed trajectory; '
-                'ecological deficits and terminal misses are distinct from hard physical failures. '
+                'ecological deficits and endpoint inventory changes are distinct from hard physical failures. '
                 'This does not establish hydraulic calibration, causal attribution, or optimal operation.')
         self.result = _json(result)
         self.closed = True

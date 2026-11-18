@@ -8,9 +8,8 @@ train:
   use_linear_lr_decay: false
   use_proper_time_limits: true
 model:
-  # Actor inputs include own terminal target, issued 7-day forecast and expected
-  # remaining external volume (18 total, or 14 without supplied daily limits).
-  # The critic receives 53/33 values including all five planning contexts.
+  # Actor inputs include the local issued 7-day inflow forecast (16 features
+  # with daily limits, 12 without). The centralized critic receives 43/23.
   # Flattened encoder [64, 128, 256] + one 256-unit hidden head.
   # Actors and the critic build separate MLPs with this same layout.
   hidden_sizes: [64, 128, 256, 256]

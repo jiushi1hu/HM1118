@@ -187,6 +187,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.correctness_enabled = correctness_enabled
         self.correctness_update_history = []
         self.correctness_trajectory = None
+        self.operation_trajectory = None
         self.correctness_final_update = None
         self.diagnostics_enabled = bool(args['experiment'].get('diagnostics', False) or
                                         trajectory_log is not None or correctness_enabled)
@@ -327,15 +328,6 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             self.counterfactual_context['actions'] = np.empty(shape, dtype=np.int64)
             self.counterfactual_context['dates'] = np.empty(shape[:2], dtype=object)
             self.counterfactual_context['episode_ids'] = ids
-            if self.physical_config.get('terminal_storage_equal_initial', False):
-                self.counterfactual_context['terminal_target'] = np.empty(
-                    shape[:2]+(self.num_agents,), dtype=np.float64)
-                self.counterfactual_context['terminal_remaining_days'] = np.empty(
-                    shape[:2], dtype=np.int64)
-                self.counterfactual_context['terminal_forecast'] = np.empty(
-                    shape[:2]+(self.num_agents,), dtype=np.float64)
-                self.counterfactual_context['terminal_future_external_volume_m3'] = np.empty(
-                    shape[:2]+(self.num_agents,), dtype=np.float64)
             self.counterfactual_probabilities = np.empty(shape+(self.action_bins,), dtype=np.float32)
         if self.trajectory_log is not None:
             self.trajectory_log.begin_batch(seed=self.seed, update=self.update_count+1,
@@ -374,15 +366,6 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                         ('controls','controls'), ('actions','sampled_actions')):
                         context[name][t] = np.stack([row[source] for row in transitions])
                     context['dates'][t] = [row['date'] for row in transitions]
-                    if 'terminal_target' in context:
-                        context['terminal_target'][t] = np.stack(
-                            [row['terminal_target'] for row in transitions])
-                        context['terminal_remaining_days'][t] = np.asarray(
-                            [row['terminal_remaining_days'] for row in transitions])
-                        context['terminal_forecast'][t] = np.stack(
-                            [row['terminal_forecast'] for row in transitions])
-                        context['terminal_future_external_volume_m3'][t] = np.stack(
-                            [row['terminal_future_external_volume_m3'] for row in transitions])
                 if self.trajectory_log is not None:
                     self.trajectory_log.capture(t, transitions)
                 done = np.array([r['done'] for r in results])
@@ -607,6 +590,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 policy_update=self.update_count, expected_steps=selected['episode_horizon_days'],
                 status=result['status'])
             self.correctness_trajectory = evidence
+            from harl.envs.cascade_reservoir.operation_trajectory import capture_operation_trajectory
+            self.operation_trajectory = capture_operation_trajectory(
+                self.actor, self.data, self.physical_config, seed=self.seed,
+                episode=self.completed_episodes, policy_update=self.update_count,
+                training_steps=self.training_steps, scenario=selected,
+                gamma=self.algo_args['algo']['gamma'])
         self._annotate_learning_rewards(record)
         self.periodic_evaluation_history.append(record)
         self._log_record(record)
@@ -614,12 +603,11 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         interval = getattr(self, '_console_log_interval', 1)
         if self.update_count == 0 or self.update_count == total or self.update_count % interval == 0:
             ecology = record.get('ecological_flow_violation_rate')
-            print('seed={} phase=evaluation update={}/{} windows={}/{} return={} terminal_pass={}/{} ecological_violation={}'.format(
+            print('seed={} phase=evaluation update={}/{} windows={}/{} return={} ecological_violation={}'.format(
                 self.seed, self.update_count, total,
                 record.get('completed_window_count', record.get('successful_window_count', 0)),
                 record.get('window_count', len(self.periodic_windows)),
                 self._progress_number(self._progress_return(record)),
-                record.get('terminal_pass_window_count', 0), record.get('terminal_required_window_count', 0),
                 'unavailable' if ecology is None else '{:.2f}%'.format(100.*ecology)), flush=True)
         return record
 
@@ -649,7 +637,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 evaluation_source_years=years, episode_horizon_days=self.length,
                 status='failed', gamma=self.algo_args['algo']['gamma'],
                 **episode_constraint_status(completed=False, physical_feasible=False,
-                    terminal_enabled=self.physical_config.get('terminal_storage_equal_initial', False)),
+                    service_shortfalls=None),
                 failure=dict(error_type=type(exc).__name__, reason=str(exc),
                     date=progress.get('date', str(years[0])+'-01-01'),
                     episode_step=progress.get('episode_step', 1),
@@ -665,8 +653,6 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                        if year in row['source_years']])
         self._annotate_learning_rewards(row)
         self._log_record(row)
-        terminal = row.get('terminal_met')
-        print('seed={} phase=held-out-evaluation status=completed return={} terminal={}'.format(
-            self.seed, self._progress_number(self._progress_return(row)),
-            'met' if terminal is True else 'missed' if terminal is False else 'not-applicable'), flush=True)
+        print('seed={} phase=held-out-evaluation status=completed return={}'.format(
+            self.seed, self._progress_number(self._progress_return(row))), flush=True)
         return [row]

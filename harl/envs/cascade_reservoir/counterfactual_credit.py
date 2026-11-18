@@ -92,16 +92,13 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
 
     Context arrays storage_start/external/actions/storage_lower/storage_upper
     and optional controls are [T,N,5]; actions are original integer commands.
-    Extra context provenance fields are ignored. Next states are [T,N,33/53],
+    Extra context provenance fields are ignored. Next states are [T,N,23/43],
     old probabilities [T,N,5,K], continuation masks [T,N,1]. Call before any
     actor, critic or ValueNorm update. Candidate batches never exceed batch_size.
 
     Candidate next-state templates retain the actual next-date forcing/calendar,
-    bounds, five issued forecasts, five episode terminal targets and five
-    estimated future external volumes. Optional terminal_future_external_volume_m3
-    context is passed unchanged to every candidate dispatch. Only
-    storage and previous-release features change under a candidate command;
-    normalized target fractions are invariant to that storage change.
+    bounds and five issued forecasts. Only storage and previous-release features
+    change under a candidate command; the episode end imposes no storage target.
     Terminal rows and gamma=0 never query the critic. No environment, optimizer,
     normalizer or random state is advanced. Approximate one-step values do not
     establish long-term optimality or guaranteed performance improvement.
@@ -139,7 +136,7 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
     state_sizes = tuple(critic_state_size(limits) for limits in (False, True))
     if (states.ndim != 3 or states.shape[:2] != (time, lanes) or states.shape[-1] not in state_sizes
             or not np.isfinite(states).all()):
-        raise ValueError('Counterfactual next states must be finite [time, lanes, 33/53] arrays')
+        raise ValueError('Counterfactual next states must be finite [time, lanes, 23/43] arrays')
     states = states.astype(np.float32, copy=False).reshape(-1, states.shape[-1])
     masks = _finite_array(continuation_masks, (time, lanes, 1), 'continuation masks').reshape(-1)
     if not np.isin(masks, (0., 1.)).all():
@@ -150,27 +147,6 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
     if (span <= 0.).any() or (caps <= 0.).any():
         raise ValueError('Storage spans and release capacities must be positive')
     rows = time*lanes
-    terminal_names = ('terminal_target', 'terminal_remaining_days', 'terminal_forecast')
-    present = [name in context for name in terminal_names]
-    if any(present) and not all(present):
-        raise ValueError('Counterfactual terminal context requires target, remaining days and forecast')
-    volume_name = 'terminal_future_external_volume_m3'
-    if volume_name in context and not all(present):
-        raise ValueError('Counterfactual future external volume requires complete terminal context')
-    terminal = None
-    if all(present):
-        terminal = dict(
-            target=_finite_array(context['terminal_target'],
-                (time, lanes, agents), 'terminal_target').reshape(-1, agents),
-            remaining_days=_finite_array(context['terminal_remaining_days'],
-                (time, lanes), 'terminal_remaining_days').reshape(-1),
-            forecast=_finite_array(context['terminal_forecast'],
-                (time, lanes, agents), 'terminal_forecast').reshape(-1, agents))
-        if volume_name in context:
-            volume = _finite_array(context[volume_name], (time, lanes, agents), volume_name)
-            if (volume < 0.).any():
-                raise ValueError('Counterfactual future external volume must be nonnegative')
-            terminal['future_external_volume_m3'] = volume.reshape(-1, agents)
     total = rows*agents*bins
     q_flat = np.empty(total, dtype=np.float64)
     predict = getattr(critic, 'get_values', critic)
@@ -182,10 +158,8 @@ def compute_counterfactual_credit(physics, operation_reward, critic, value_norma
         command = indices % bins
         normalized = actions[row].astype(np.float64)/(bins-1)
         normalized[np.arange(len(indices)), actor] = command/(bins-1)
-        options = ({} if terminal is None else
-                   dict(terminal={name:value[row] for name, value in terminal.items()}))
         dispatch = batched_transition(physics, values['storage_start'][row], values['external'][row],
-            normalized, values['storage_lower'][row], values['storage_upper'][row], **options)
+            normalized, values['storage_lower'][row], values['storage_upper'][row])
         q = system_rewards_from_dispatch(operation_reward, dispatch)
         continuing = masks[row] > 0.
         if gamma > 0. and continuing.any():

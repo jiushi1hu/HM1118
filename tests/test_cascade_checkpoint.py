@@ -86,8 +86,8 @@ class CascadeCheckpointTest(unittest.TestCase):
         self.assertEqual(policy.metadata['actor_value_channels'], list(self.runner.actor_value_channels))
         self.assertEqual(policy.metadata['observation']['actor_observation_layout'], ACTOR_OBSERVATION_LAYOUT)
         self.assertEqual(policy.metadata['observation']['critic_state_layout'], CRITIC_STATE_LAYOUT)
-        self.assertEqual(policy.metadata['observation']['actor_observation_size'], 18)
-        self.assertEqual(policy.metadata['observation']['critic_state_size'], 53)
+        self.assertEqual(policy.metadata['observation']['actor_observation_size'], 16)
+        self.assertEqual(policy.metadata['observation']['critic_state_size'], 43)
         state = self.runner.envs[0].state()
         with torch.no_grad():
             self.assertEqual(tuple(policy.critic(state[None]).shape), (1, self.runner.critic_output_dim))
@@ -287,11 +287,11 @@ class CascadeCheckpointTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_checkpoint(self.path)
 
-    def test_forecast_and_target_observation_layout_cannot_be_mislabeled(self):
+    def test_issued_forecast_observation_layout_cannot_be_mislabeled(self):
         save_checkpoint(self.runner, self.path)
         original = self.payload()
         changes = (dict(actor_observation_layout='local_neighbors_next_day_limits_next7d_forecast_v3'),
-                   dict(actor_observation_size=16), dict(critic_state_layout='unknown'),
+                   dict(actor_observation_size=17), dict(critic_state_layout='unknown'),
                    dict(critic_state_size=38))
         for change in changes:
             with self.subTest(change=change):
@@ -351,8 +351,8 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
         self.assertEqual(len(stored['metadata']['model_hashes']['actors']), 1)
         self.assertTrue(stored['metadata']['actor_parameter_sharing'])
         self.assertEqual(stored['metadata']['agent_ids'], list(range(5)))
-        self.assertEqual(stored['metadata']['raw_actor_observation_dim'], 18)
-        self.assertEqual(stored['metadata']['actor_observation_dim'], 23)
+        self.assertEqual(stored['metadata']['raw_actor_observation_dim'], 16)
+        self.assertEqual(stored['metadata']['actor_observation_dim'], 21)
         before = torch.get_rng_state().clone()
         numpy_before, random_before = np.random.get_state(), random.getstate()
         frozen = load_checkpoint(self.path)
@@ -365,7 +365,7 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
         self.assertFalse(hasattr(frozen.actors[0].core, 'actor_optimizer'))
         first_linear = next(module for module in frozen.actors[0].actor.modules()
                             if isinstance(module, torch.nn.Linear))
-        self.assertEqual(first_linear.in_features, 23)
+        self.assertEqual(first_linear.in_features, 21)
         observation = self.runner.envs[0].actor_observations()[0:1]
         for original, view in zip(self.runner.actor, frozen.actors):
             with torch.no_grad():

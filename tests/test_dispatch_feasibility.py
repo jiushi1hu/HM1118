@@ -82,19 +82,12 @@ def synthetic_dispatch(*, head_model='fixed', bins=200, available_water=30.,
 
 def brute_grid(env, row, reservoir):
     actions = row['sampled_actions'].astype(float)/(env.action_bins-1)
-    terminal = None
-    if row.get('terminal_target') is not None:
-        terminal = dict(target=row['terminal_target'],
-            remaining_days=row['terminal_remaining_days'], forecast=row['terminal_forecast'])
-        if 'terminal_future_external_volume_m3' in row:
-            terminal['future_external_volume_m3'] = row['terminal_future_external_volume_m3']
     results = []
     for index in range(env.action_bins):
         candidate = actions.copy()
         candidate[reservoir] = index/(env.action_bins-1)
         results.append(env.physics.transition(row['storage_start'], row['external'],
-            candidate, row['storage_lower_m3'], row['storage_upper_m3'],
-            terminal=terminal))
+            candidate, row['storage_lower_m3'], row['storage_upper_m3']))
     return results
 
 
@@ -102,7 +95,7 @@ class DispatchFeasibilityTest(unittest.TestCase):
     def test_historical_all_five_exact_grid_against_full_cascade(self):
         config = yaml.safe_load((ROOT/'harl/configs/envs_cfgs/cascade_reservoir.yaml').read_text())
         for head in ('fixed', 'storage_sensitivity'):
-            physical = dict(config, head_model=head, terminal_storage_equal_initial=False)
+            physical = dict(config, head_model=head)
             data = CascadeData(ROOT/'data/cascade_reservoir_new', physical)
             env = episode_environment(data, physical, [1965], days=4, action_bins=21)
             env.operation_reward.requirements = SimpleNamespace(ecological_flow_m3s=np.full(5, 1e6))
@@ -121,9 +114,9 @@ class DispatchFeasibilityTest(unittest.TestCase):
                     self.assertTrue(record['ecological_flow_release_limit_proven'])
                 json.dumps(records, allow_nan=False)
 
-    def test_rolling_terminal_window_is_preserved_by_diagnostic_witnesses(self):
+    def test_episode_end_diagnostic_witnesses_preserve_the_physical_action_grid(self):
         physical = yaml.safe_load((ROOT/'harl/configs/envs_cfgs/cascade_reservoir.yaml').read_text())
-        physical.update(head_model='fixed', terminal_storage_equal_initial=True)
+        physical.update(head_model='fixed')
         data = CascadeData(ROOT/'data/cascade_reservoir_new', physical)
         env = episode_environment(data, physical, [1965], days=4, action_bins=11)
         initial = env.storage.copy()
@@ -139,9 +132,8 @@ class DispatchFeasibilityTest(unittest.TestCase):
                 for candidate in expected:
                     np.testing.assert_allclose(candidate['storage_end']-candidate['storage_start'],
                         (candidate['inflow']-candidate['release'])*86400., rtol=0., atol=1e-4)
-        self.assertIsNotNone(env.terminal_report)
-        np.testing.assert_allclose(env.terminal_report['deviation_m3'],
-                                   env.storage-initial, rtol=0., atol=1e-6)
+        self.assertGreater(float(np.abs(env.storage-initial).max()), 1.)
+        self.assertTrue(row['controls'].any())
 
     def test_all_station_grid_quantization_and_forced_release_limits(self):
         for i in range(5):

@@ -1,5 +1,7 @@
-"""Render six observational correctness figures using NumPy and Matplotlib only."""
+"""Render seven observational correctness figures using NumPy and Matplotlib only."""
 import argparse
+import calendar
+from datetime import date
 import json
 from pathlib import Path
 import sys
@@ -7,7 +9,8 @@ import sys
 import numpy as np
 
 FIGURE_KEYS = ('mass_balance', 'water_levels', 'release_feasibility',
-               'terminal_storage', 'reward_reconciliation', 'happo_updates')
+               'storage_change', 'reward_reconciliation', 'happo_updates',
+               'operation_trajectories')
 IDS = ('WDD', 'BHT', 'XLD', 'XJB', 'THR')
 VECTOR_FIELDS = ('storage_start', 'storage_end', 'levels_start', 'levels_end',
     'external', 'inflow', 'release', 'low', 'high', 'controls', 'power', 'energy',
@@ -40,8 +43,8 @@ def _finite_tree(value, name='evidence'):
 
 def validate_payload(payload):
     """Reject malformed evidence before allocating figures; preserve source values."""
-    if not isinstance(payload, dict) or payload.get('schema') != 'cascade_correctness_v1':
-        raise ValueError('Expected evidence schema cascade_correctness_v1')
+    if not isinstance(payload, dict) or payload.get('schema') != 'cascade_correctness_v2':
+        raise ValueError('Expected evidence schema cascade_correctness_v2')
     _finite_tree(payload)
     runs = payload.get('runs')
     if not isinstance(runs, list) or not runs:
@@ -95,16 +98,10 @@ def validate_payload(payload):
                 rows = series.get(key)
                 if rows is not None and any(row is not None for row in rows):
                     _array(rows, (steps, 5), 'series.'+key)
-            for key in ('terminal_plan_rejected', 'terminal_fallback'):
-                rows = series.get(key)
-                if rows is not None and any(row is not None for row in rows):
-                    _array(rows, (steps,), 'series.'+key)
-        for record in run.get('terminal_records', []):
-            if record.get('enabled') and record.get('available', False):
-                for key in ('target_m3', 'final_storage_m3', 'deviation_m3', 'tolerance_m3'):
-                    _array(record[key], (5,), 'terminal_records.'+key)
-                if (np.asarray(record['tolerance_m3']) <= 0).any():
-                    raise ValueError('Terminal storage tolerances must be positive')
+        for record in run.get('storage_records', []):
+            if record.get('available', False):
+                for key in ('initial_storage_m3', 'final_storage_m3', 'storage_change_m3'):
+                    _array(record[key], (5,), 'storage_records.'+key)
         previous = 0
         for record in run.get('update_records', []):
             number = record['update']
@@ -172,8 +169,178 @@ def _likelihood_axis(ax, values):
     ax.axhline(1., color='black', ls='--', lw=.6, label='_nolegend_')
 
 
+def _operation_series(run):
+    """Map retained calendar dates to five annual segments, including leap days.
+
+    Levels are end-of-action-day values; releases are averages over that day.
+    Earlier evidence may lack the full-calendar replay. Its recorded prefix is
+    usable, but missing days and December 31 markers are never manufactured.
+    """
+    trajectory = run.get('operation_trajectory')
+    if trajectory is None:
+        trajectory = run['trajectory']
+    if not isinstance(trajectory, dict):
+        raise ValueError('operation_trajectory must be an evidence object')
+    count = trajectory.get('steps', 0)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError('operation_trajectory.steps must be a nonnegative integer')
+    series = trajectory.get('series', {})
+    raw_dates = series.get('date', [])
+    if len(raw_dates) != count:
+        raise ValueError('Operation dates must match the recorded step count')
+    try:
+        dates = [date.fromisoformat(value) for value in raw_dates]
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Operation dates must use the YYYY-MM-DD calendar format') from exc
+    years = list(trajectory.get('source_years', []))
+    if not years and dates:
+        years = list(dict.fromkeys(day.year for day in dates))
+    if (len(years) > 5 or len(set(years)) != len(years) or
+            any(isinstance(year, bool) or not isinstance(year, int) or
+                not 1 <= year <= 9999 for year in years)):
+        raise ValueError('Operation source_years must contain at most five distinct calendar years')
+    # A partial/legacy trace still has a five-year display, with its unexecuted
+    # suffix left blank. These inferred years supply axis labels only.
+    while years and len(years) < 5:
+        years.append(years[-1]+1)
+    x_end, x_mid = [], []
+    for day in dates:
+        if day.year not in years:
+            raise ValueError('An operation date falls outside the five annual segments')
+        segment = years.index(day.year)
+        year_days = 366 if calendar.isleap(day.year) else 365
+        ordinal = (day-date(day.year, 1, 1)).days+1
+        x_end.append(segment+ordinal/year_days)
+        x_mid.append(segment+(ordinal-.5)/year_days)
+    if dates:
+        for previous, current in zip(dates, dates[1:]):
+            same_year = current.year == previous.year
+            joined_year = (years.index(current.year) == years.index(previous.year)+1 and
+                           (previous.month, previous.day) == (12, 31) and
+                           (current.month, current.day) == (1, 1))
+            if not ((same_year and (current-previous).days == 1) or joined_year):
+                raise ValueError('Operation dates must be daily and ordered within annual segments')
+        levels = _array(series['levels_end'], (count, 5), 'operation levels_end')
+        starts = _array(series['levels_start'], (count, 5), 'operation levels_start')
+        release = _array(series['release'], (count, 5), 'operation release')
+        initial_x = x_end[0]-1/(366 if calendar.isleap(dates[0].year) else 365)
+    else:
+        levels = starts = release = np.empty((0, 5))
+        initial_x = 0.
+    return dict(trajectory=trajectory, years=years, dates=dates,
+                x_end=np.asarray(x_end), x_mid=np.asarray(x_mid), initial_x=initial_x,
+                levels=levels, starts=starts, release=release,
+                december31=np.asarray([(day.month, day.day) == (12, 31) for day in dates], dtype=bool))
+
+
+def make_operation_figure(payload):
+    """Plot the final HAPPO policy over exactly five calendar-year segments."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import MaxNLocator
+
+    runs = payload['runs']
+    prepared = [_operation_series(run) for run in runs]
+    level_color, marker_color = '#ed858f', '#bc5663'
+    with plt.rc_context({'font.family': 'serif', 'font.size': 9}):
+        figure, axes = plt.subplots(5, len(runs), figsize=(6.1*len(runs), 10.5),
+                                   squeeze=False, sharex=True)
+        figure.subplots_adjust(left=.085 if len(runs) == 1 else .055,
+                               right=.88 if len(runs) == 1 else .95,
+                               bottom=.13, top=.88, hspace=.16, wspace=.36)
+        figure.suptitle('HAPPO: five-year reservoir operation trajectories', y=.985, fontsize=14)
+        figure.legend(handles=[
+            Line2D([], [], color=level_color, lw=1.1, label='Daily water level (left axis)'),
+            Line2D([], [], color=marker_color, lw=.8, ls='--', label='Daily release (right axis)'),
+            Line2D([], [], color=marker_color, marker='o', lw=0,
+                   label='December 31 end-of-day water level')],
+            loc='upper center', bbox_to_anchor=(.5, .96), ncol=3, frameon=False, fontsize=9)
+        for column, (run, data) in enumerate(zip(runs, prepared)):
+            trajectory, years = data['trajectory'], data['years']
+            full_days = sum(366 if calendar.isleap(year) else 365 for year in years)
+            complete = bool(len(data['dates']) == full_days and len(years) == 5 and
+                            data['december31'].sum() == 5)
+            context = 'Seed {} | {}'.format(run['seed'], trajectory.get('scenario_id', 'selected scenario'))
+            if not complete:
+                context += '\n{} / {} recorded days ({})'.format(
+                    len(data['dates']), full_days if years else 'five years',
+                    trajectory.get('status', 'partial'))
+            ticks, tick_labels = [], []
+            for segment, year in enumerate(years):
+                year_days = 366 if calendar.isleap(year) else 365
+                ticks.extend((segment, segment+(date(year, 7, 1)-date(year, 1, 1)).days/year_days))
+                tick_labels.extend(('Jan', 'Jul'))
+            ticks.append(5.)
+            tick_labels.append('Jan')
+            for i, reservoir in enumerate(IDS):
+                ax = axes[i, column]
+                flow = ax.twinx()
+                ax.set_gid('operation_level_seed{}_{}'.format(run['seed'], reservoir))
+                flow.set_gid('operation_release_seed{}_{}'.format(run['seed'], reservoir))
+                ax.spines['top'].set_visible(False)
+                flow.spines['top'].set_visible(False)
+                ax.grid(axis='y', alpha=.25, ls=':', lw=.6)
+                ax.set_ylabel(reservoir+'\nWater level (m)', fontsize=10)
+                flow.set_ylabel('Release (m³/s)', fontsize=9)
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+                ax.ticklabel_format(axis='y', style='plain', useOffset=False)
+                flow.yaxis.set_major_locator(MaxNLocator(nbins=4))
+                flow.ticklabel_format(axis='y', style='plain', useOffset=False)
+                for segment, year in enumerate(years):
+                    year_days = 366 if calendar.isleap(year) else 365
+                    flood_start = segment+(date(year, 6, 1)-date(year, 1, 1)).days/year_days
+                    flood_end = segment+(date(year, 10, 1)-date(year, 1, 1)).days/year_days
+                    ax.axvspan(flood_start, flood_end, color='gray', alpha=.10, lw=0)
+                for boundary in range(1, 6):
+                    ax.axvline(boundary, color=marker_color, ls='--', lw=.55, alpha=.45)
+                if data['dates']:
+                    level_values = np.r_[data['starts'][0, i], data['levels'][:, i]]
+                    level_line, = ax.plot(np.r_[data['initial_x'], data['x_end']], level_values,
+                                         color=level_color, lw=1.1, label='Daily water level')
+                    level_line.set_gid('water_level')
+                    release_line, = flow.plot(data['x_mid'], data['release'][:, i],
+                                             color=marker_color, lw=.7, ls='--', alpha=.85,
+                                             label='Daily release')
+                    release_line.set_gid('release_discharge')
+                    flow.set_ylim(max(float(data['release'][:, i].max())*1.12, 1.), 0.)
+                    mask = data['december31']
+                    markers = ax.scatter(data['x_end'][mask], data['levels'][mask, i],
+                                         s=27, facecolors=marker_color, edgecolors=marker_color,
+                                         linewidths=.5, zorder=5, label='December 31 water level')
+                    markers.set_gid('december31_levels')
+                    for x, y in zip(data['x_end'][mask], data['levels'][mask, i]):
+                        ax.annotate('{:.1f} m'.format(y), (x, y), xytext=(-3 if x == 5. else 0, 9),
+                                    textcoords='offset points', color=marker_color, fontsize=7,
+                                    ha='right' if x == 5. else 'center', annotation_clip=False)
+                    # Leave room for labels without imposing any operating target.
+                    span = max(float(np.ptp(level_values)), 1.)
+                    ax.set_ylim(float(level_values.min())-.08*span,
+                                float(level_values.max())+.22*span)
+                else:
+                    flow.set_ylim(1., 0.)
+                    ax.text(.5, .5, 'Unavailable: '+trajectory.get('reason', trajectory.get('status', 'no executed days')),
+                            transform=ax.transAxes, ha='center', va='center', fontsize=8, wrap=True)
+                ax.set_xlim(0., 5.)
+                ax.set_xticks(ticks, tick_labels, fontsize=8)
+                ax.text(.01, .04, '({})'.format(chr(ord('a')+i+5*column)),
+                        transform=ax.transAxes, color=marker_color, fontsize=10, fontweight='bold')
+                if i == 0:
+                    ax.set_title(context, fontsize=10, color=marker_color, pad=9)
+                if i == 4:
+                    for segment in range(5):
+                        label = 'Year {}\n{}'.format(segment+1, years[segment]) if years else 'Year '+str(segment+1)
+                        ax.text(segment+.5, -.22, label, ha='center', va='top',
+                                transform=ax.get_xaxis_transform(), fontsize=8)
+            axes[-1, column].set_xlabel('Five annual operation segments', labelpad=31)
+        figure.text(.5, .015,
+                     'Gray bands: June–September. Release axis is reversed. '
+                     'Markers use executed December 31 levels; unrecorded days remain blank.',
+                     ha='center', fontsize=8)
+    return figure
+
+
 def make_figures(payload):
-    """Return six figures from saved evidence without model imports or mutation."""
+    """Return seven figures from saved evidence without model imports or mutation."""
     try:
         runs = validate_payload(payload)
     except (KeyError, TypeError) as exc:
@@ -181,7 +348,7 @@ def make_figures(payload):
     import matplotlib.pyplot as plt
     figures = {}
     titles = dict(mass_balance='Independent daily mass balance: residual and numerical tolerance',
-        water_levels='Executed water levels, permitted next-state limits and terminal target',
+        water_levels='Executed water levels and permitted next-state limits',
         release_feasibility='Executed release, physical / mapping bounds and ecological requirement',
         reward_reconciliation='Reported reward components and independent reconciliation')
     for key, title in titles.items():
@@ -189,7 +356,7 @@ def make_figures(payload):
                                     rows=6 if key in ('mass_balance', 'reward_reconciliation') else 5)
         if key == 'release_feasibility':
             figures[key].supxlabel(
-                'Nonfinal plan rejection retains actor control; forced markers denote controls = 0.', fontsize=8)
+                'Forced markers denote a collapsed physical release interval.', fontsize=8)
         for column, run in enumerate(runs):
             trajectory = run['trajectory']
             count = trajectory['steps']
@@ -223,12 +390,6 @@ def make_figures(payload):
                         if bounds is not None:
                             ax.axhline(bounds[0], color='gray', label='Global lower bound')
                             ax.axhline(bounds[1], color='gray', ls='--', label='Global upper bound')
-                    target = physical.get('target_level_m')
-                    if target is not None:
-                        ax.axhline(target[i], color='purple', ls=':', label='Terminal target (final day only)')
-                    elif i == 0:
-                        status = 'unavailable' if physical.get('terminal_storage_equal_initial') else 'disabled'
-                        ax.text(.02, .03, 'Terminal target '+status, transform=ax.transAxes, fontsize=7)
                     ax.set_ylabel(reservoir+' level (m)')
                 elif key == 'release_feasibility':
                     low, high, release = (np.asarray(series[name])[:, i] for name in ('low', 'high', 'release'))
@@ -249,15 +410,6 @@ def make_figures(payload):
                     forced = np.asarray(series['controls'])[:, i] == 0
                     ax.scatter(x[forced], release[forced], marker='x', s=12, color='red',
                                label='Forced action ({} days)'.format(int(forced.sum())))
-                    for name, marker, color, label in (
-                        ('terminal_plan_rejected', '^', 'darkorange', 'Plan rejection'),
-                        ('terminal_fallback', 's', 'black', 'Final fallback')):
-                        flags = series.get(name)
-                        if flags is not None and all(flag is not None for flag in flags):
-                            marked = np.asarray(flags, dtype=bool)
-                            ax.scatter(x[marked], release[marked], marker=marker, s=13, color=color,
-                                       facecolors='none' if marker == 's' else color,
-                                       label=label+' ({} days)'.format(int(marked.sum())))
                     ax.set_ylabel(reservoir+' release (m³/s)')
                 else:
                     for name, sign, label in (('local_generation_rewards', 1, 'Local generation'),
@@ -295,20 +447,14 @@ def make_figures(payload):
                 if maximum is not None:
                     ax.text(.02, .03, 'Max reconciliation error (all rewards): {:.3g}'.format(maximum),
                             transform=ax.transAxes, fontsize=7)
-    figures['terminal_storage'], axes = _panels(plt, runs,
-        'Terminal storage: final batch / final evaluation points; all-history pass counts')
-    from matplotlib.ticker import SymmetricalLogLocator
+    figures['storage_change'], axes = _panels(plt, runs,
+        'Endpoint storage change: final batch / final evaluations (inventory accounting)')
     for column, run in enumerate(runs):
-        all_records = run.get('terminal_records', [])
         records = []
-        history_labels = []
+        counts = []
         for phase, label in (('training', 'Train'), ('training_evaluation', 'Eval'), ('evaluation', 'Held-out')):
-            history = [record for record in all_records if record.get('phase') == phase]
-            measured = [record for record in history if record.get('enabled') and record.get('available')]
-            passed = sum(record.get('met') is True for record in measured)
-            disabled = sum(not record.get('enabled', False) for record in history)
-            history_labels.append('{}: {}/{} met{}'.format(label, passed, len(measured),
-                '; {} disabled'.format(disabled) if disabled else ''))
+            history = [record for record in run.get('storage_records', []) if record.get('phase') == phase]
+            counts.append('{}: {} inventories'.format(label, sum(record.get('available', False) for record in history)))
             if history:
                 latest = max(record.get('policy_update', 0) for record in history)
                 records.extend(record for record in history if phase == 'evaluation' or
@@ -316,8 +462,8 @@ def make_figures(payload):
         labels = []
         for record in records:
             phase = {'training': 'Train', 'training_evaluation': 'Eval',
-                     'evaluation': 'Held-out'}.get(record.get('phase'), record.get('phase', 'Case'))
-            scenario = record.get('scenario_id', 'case').replace('final_collection_', '').replace('collection_', '').replace('episode_', 'ep')
+                     'evaluation': 'Held-out'}.get(record.get('phase'), 'Case')
+            scenario = record.get('scenario_id', 'case').replace('collection_', '').replace('episode_', 'ep')
             if scenario == 'held_out_sequence':
                 scenario = 'sequence'
             labels.append('{} {}\nu{}'.format(phase, scenario, record.get('policy_update', '?')))
@@ -326,28 +472,20 @@ def make_figures(payload):
             ax.clear()
             ax.grid(alpha=.2)
             if i == 0:
-                ax.set_title('Seed {} | all-history terminal counts\n{}'.format(
-                    run['seed'], ' | '.join(history_labels)), fontsize=8)
-            if i == 4:
-                ax.set_xlabel('Recorded final episode / scenario')
-            ax.set_ylabel(reservoir+' deviation / tolerance')
-            ax.axhline(1., color='darkorange', ls='--', lw=.7, label='± tolerance')
-            ax.axhline(-1., color='darkorange', ls='--', lw=.7)
+                ax.set_title('Seed {} | all saved endpoints\n{}'.format(run['seed'], ' | '.join(counts)), fontsize=8)
+            ax.set_ylabel(reservoir+' final − initial (billion m³)')
+            ax.axhline(0., color='gray', ls='--', lw=.7, label='Zero change (reference)')
             for position, record in enumerate(records):
-                if not record.get('enabled', False):
-                    ax.text(position, 0, 'Disabled', rotation=90, fontsize=7, ha='center')
-                elif not record.get('available', False):
-                    ax.text(position, 0, 'Unavailable / '+record.get('status', 'partial'), rotation=90, fontsize=7, ha='center')
+                if record.get('available', False):
+                    ax.scatter(position, record['storage_change_m3'][i]/1e9, s=24, color='tab:blue')
                 else:
-                    ratio = record['deviation_m3'][i]/record['tolerance_m3'][i]
-                    ax.scatter(position, ratio, s=24, color='crimson' if abs(ratio) > 1 else 'tab:blue')
+                    ax.text(position, 0, 'Unavailable / '+record.get('status', 'partial'),
+                            rotation=90, fontsize=7, ha='center')
             if not records:
-                ax.text(.5, .5, 'Unavailable: no terminal records', ha='center', transform=ax.transAxes)
+                ax.text(.5, .5, 'Unavailable: no storage inventories', ha='center', transform=ax.transAxes)
             ax.set_xticks(range(len(records)), labels, rotation=35, ha='right', fontsize=7)
-            ax.set_yscale('symlog', linthresh=1.)
-            locator = SymmetricalLogLocator(base=10, linthresh=1.)
-            locator.set_params(numticks=7)
-            ax.yaxis.set_major_locator(locator)
+            if i == 4:
+                ax.set_xlabel('Recorded episode / scenario; positive = accumulation, negative = depletion')
             _legend(ax)
     figures['happo_updates'], axes = _panels(plt, runs,
         'HAPPO independent likelihood-factor checks and policy-update diagnostics', rows=6)
@@ -403,6 +541,7 @@ def make_figures(payload):
         axes[5, column].ticklabel_format(axis='y', style='plain', useOffset=False)
         axes[0, column].text(.02, .98, 'Filled: used; open: independent\nv=min, o=median, ^=p95, square=max\nColors: '+', '.join(IDS),
             transform=axes[0, column].transAxes, va='top', fontsize=6)
+    figures['operation_trajectories'] = make_operation_figure(payload)
     return {key: figures[key] for key in FIGURE_KEYS}
 
 
@@ -410,7 +549,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check-backend', action='store_true', help='Check headless Matplotlib, then exit')
     parser.add_argument('--input', type=Path, help='Evidence JSON; omit to read JSON from standard input')
-    parser.add_argument('--output-dir', type=Path, help='Output directory; may contain input evidence, but six PNG targets must be new')
+    parser.add_argument('--output-dir', type=Path, help='Output directory; may contain input evidence, but seven PNG targets must be new')
     parser.add_argument('--no-show', action='store_true', help='Use Agg and save figures without opening windows')
     args = parser.parse_args(argv)
     import matplotlib

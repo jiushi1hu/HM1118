@@ -3,6 +3,7 @@ import csv
 import json
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import IDS
+from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 from harl.envs.cascade_reservoir.reward import PENALTY_TERMS, REWARD_AGGREGATION, REWARD_DEFINITION
 
 
@@ -139,8 +140,6 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
     # Imported at call time: evaluation itself imports the compact step writer.
     from harl.envs.cascade_reservoir.evaluation import episode_constraint_status
     constraints = episode_constraint_status(completed=completed, physical_feasible=not failed,
-        terminal_enabled=getattr(env, 'terminal_storage_equal_initial', False),
-        terminal_objective=getattr(env, 'terminal_report', None),
         service_shortfalls=rewards.shortfall_summary())
     return dict(record_type='training_episode', seed=int(seed), episode=int(episode),
         window_start_year=int(env.data.dates[env.start].year), **constraints,
@@ -166,9 +165,8 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
         reward_aggregation=REWARD_AGGREGATION, reward_definition=REWARD_DEFINITION,
         **env.observation_metadata(),
         reward_penalties=dict(env.reward_settings), reference_energy_MWh=env.physics.reference_energy,
-        terminal_objective=getattr(env, 'terminal_report', None),
-        release_bounds_scope=('cascade_prefix_forecast_budget' if getattr(
-            env, 'terminal_storage_equal_initial', False) else 'current_transition'))
+        **storage_change_summary(env.initial_storage, env.storage),
+        release_bounds_scope='current_transition')
 
 
 def log_episode(record, stream=None, *, console=False):

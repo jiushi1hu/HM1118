@@ -6,39 +6,24 @@ from harl.envs.cascade_reservoir.episodes import (
     DEFAULT_ACTION_BINS, DEFAULT_EPISODE_DAYS, episode_environment)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.training_metrics import log_step, step_record
+from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 from harl.envs.cascade_reservoir.reward import (
     EpisodeRewardMetrics, validate_discount_factor, REWARD_AGGREGATION, reward_metadata)
 
 
-def episode_constraint_status(*, completed, physical_feasible, terminal_enabled,
-                              terminal_objective=None, service_shortfalls=None):
-    """Separate execution, physical constraints, terminal equality and soft ecology.
-
-    Unknown or incomplete terminal/service measurements remain null. ``feasible``
-    is retained as a physical-only compatibility alias; policy eligibility must
-    use ``required_constraints_met`` rather than completion or that alias.
-    """
-    terminal = None
-    if completed and terminal_enabled and isinstance(terminal_objective, dict):
-        measured = terminal_objective.get('met')
-        if isinstance(measured, (bool, np.bool_)):
-            terminal = bool(measured)
+def episode_constraint_status(*, completed, physical_feasible, service_shortfalls=None):
+    """Report completed physical operation separately from soft ecological service."""
     ecology = None
     if completed and isinstance(service_shortfalls, dict):
         measured = service_shortfalls.get('ecological_flow')
         if isinstance(measured, dict) and measured.get('active_reservoir_days', 0) > 0:
             ecology = measured['reservoir_day_count'] == 0
-    if not completed or physical_feasible is False or (terminal_enabled and terminal is False):
-        required = False
-    elif physical_feasible is None or (terminal_enabled and terminal is None):
-        required = None
-    else:
-        required = True
+    required = False if not completed or physical_feasible is False else (
+        None if physical_feasible is None else True)
     return dict(completed=bool(completed), physical_feasible=physical_feasible,
-        terminal_met=terminal, ecological_compliant=ecology,
-        required_constraints_met=required, feasible=physical_feasible,
-        feasible_definition='physical-only alias of physical_feasible; terminal equality is included in required_constraints_met',
-        constraint_status_definition='required constraints: physical feasibility and enabled terminal equality; ecological flow remains a soft service objective')
+        ecological_compliant=ecology, required_constraints_met=required,
+        feasible=physical_feasible, feasible_definition='physical-only alias of physical_feasible',
+        constraint_status_definition='required constraints: completed physical operation; ecological flow remains a soft service objective')
 
 
 class DailyLimitMetrics:
@@ -67,7 +52,7 @@ class DailyLimitMetrics:
             raise InfeasibleCascade('Evaluation trajectory violates daily next-state storage limits')
         return dict(daily_level_limits=env.level_limits is not None, action_bins=env.action_bins,
             physical_feasible=True, feasible=True,
-            feasible_definition='physical-only alias; excludes the separate terminal-storage objective',
+            feasible_definition='physical-only alias of physical_feasible',
             violation_count=self.violations,
             max_daily_bound_excess_m3=self.max_bound_excess)
 
@@ -91,6 +76,7 @@ def _attach_evaluation_progress(error, env, rewards, energy):
             global_evaluator_return=totals['episode_global_reward'],
             generation_MWh=float(energy), generation_TWh=float(energy/1e6),
             ecological_flow_penalty=totals['episode_penalty_ecological_flow']))
+    error.evaluation_progress.update(storage_change_summary(env.initial_storage, env.storage))
 
 
 @torch.no_grad()
@@ -168,7 +154,7 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
         energy_MWh=energy, energy_TWh=energy/1e6, spill_volume_m3=spill,
         max_balance_residual_m3=residual, head_model=env.physics.head_model,
         head_data_status=env.physics.head_data_status,
-        terminal_objective=getattr(env, 'terminal_report', None),
+        **storage_change_summary(initial, env.storage),
         **env.observation_metadata())
     for i, name in enumerate(IDS):
         result[name+'_start_m3'] = float(initial[i])
@@ -181,8 +167,7 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
     result.update(reward_metrics.summary(detailed=True), **reward_metadata(data),
         reward_penalties=env.reward_settings, reward_aggregation=REWARD_AGGREGATION)
     result.update(episode_constraint_status(completed=True, physical_feasible=True,
-        terminal_enabled=env.terminal_storage_equal_initial,
-        terminal_objective=result['terminal_objective'], service_shortfalls=result['service_shortfalls']))
+        service_shortfalls=result['service_shortfalls']))
     if diagnostics:
         result.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
             spill_by_reservoir_billion_m3=(spill_by_reservoir/1e9).tolist(),
