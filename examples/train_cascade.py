@@ -18,7 +18,8 @@ from harl.runners.cascade_reservoir_runner import (
     validate_gae_lambda, validate_seed, validate_credit_assignment)
 from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths,
-    trajectory_diagnostics_paths, checkpoint_directories, counterfactual_credit_paths)
+    trajectory_diagnostics_paths, checkpoint_directories, counterfactual_credit_paths,
+    daily_change_paths, flatten_output_paths)
 from examples.train_cascade_parallel import validate_correctness_output
 
 
@@ -78,13 +79,14 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
                         help='Also save every N completed updates; 0 saves only the final policy; requires --save-checkpoints')
     parser.add_argument('--skip-final-evaluation',action='store_true',help='Reserve evaluation years during tuning')
     parser.add_argument('--episode-log',type=Path,
-                        help='New summary JSONL path; also creates compact <stem>_seedN_steps.csv files')
+                        help='New summary JSONL path; also creates compact per-seed CSVs and automatic daily-change diagnostics')
     parser.add_argument('--plot-python',default=sys.executable,help='Python interpreter with interactive Matplotlib')
     parser.add_argument('--plot-output',type=Path,
-                        help='Figure output stem: save _training.png, _evaluator_return.png and _violation_rates.png without requiring --episode-log')
+                        help='Figure output stem: save training/evaluator/violation figures plus automatic daily-change diagnostics in the parent run directory')
     parser.add_argument('--correctness-output',type=Path,
                         help='New directory for evidence.json and seven correctness figures; enables observational diagnostics and works with --no-plot')
-    parser.add_argument('--no-plot',action='store_true',help='Run without opening plot windows')
+    parser.add_argument('--no-plot',action='store_true',
+                        help='Skip legacy figures and plot windows; automatic daily-change figures are still saved with --episode-log')
     if parser_extension is not None:
         parser_extension(parser)
     args = parser.parse_args(argv)
@@ -191,6 +193,12 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
                 algo['happo_credit_assignment']=='counterfactual').values():
             if path.exists():
                 parser.error('Counterfactual trace already exists: '+str(path))
+        if not args.skip_final_evaluation:
+            for path in flatten_output_paths(daily_change_paths(
+                    args.plot_output, args.episode_log, exp['seeds'],
+                    'happo')):
+                if path.exists():
+                    parser.error('Daily-change diagnostic already exists: '+str(path))
         if not args.no_plot:
             for path in plot_output_paths(args.episode_log, args.plot_output).values():
                 if path.exists():

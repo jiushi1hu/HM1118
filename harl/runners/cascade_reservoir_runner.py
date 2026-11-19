@@ -191,6 +191,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.correctness_update_history = []
         self.correctness_trajectory = None
         self.operation_trajectory = None
+        self.final_evaluation_daily_series = None
         self.correctness_final_update = None
         self.diagnostics_enabled = bool(args['experiment'].get('diagnostics', False) or
                                         trajectory_log is not None or correctness_enabled)
@@ -644,13 +645,16 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         metadata = self.evaluation_policy_metadata()
         years = list(self.data.evaluation_years)
         modes = [actor.actor.training for actor in self.actor]
+        from harl.envs.cascade_reservoir.daily_change_diagnostics import DailyChangeRecorder
+        daily_recorder = DailyChangeRecorder(self.seed)
+        self.final_evaluation_daily_series = None
         print('seed={} phase=held-out-evaluation status=running'.format(self.seed), flush=True)
         try:
             with torch.random.fork_rng(devices=[]):
                 row = evaluate_policy(self.actor,self.data,self.physical_config,seed=self.seed,
                     episode=self.completed_episodes,training_steps=self.training_steps,diagnostics=True,
                     gamma=self.algo_args['algo']['gamma'],source_years=years,episode_days=self.length,
-                    step_log=self.step_log)
+                    step_log=self.step_log,transition_observer=daily_recorder.capture)
         except InfeasibleCascade as exc:
             progress = getattr(exc, 'evaluation_progress', {})
             self._log_record(self._annotate_learning_rewards(dict(record_type='final_evaluation_sequence', phase='evaluation',
@@ -672,6 +676,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         row.update(record_type='final_evaluation_sequence',**metadata,
                    source_year_labels=[label for year,label in zip(years,self.data.evaluation_labels)
                                        if year in row['source_years']])
+        self.final_evaluation_daily_series = (daily_recorder.finish(expected_steps=self.length)
+            if daily_recorder.dates else None)
         self._annotate_learning_rewards(row)
         self._log_record(row)
         print('seed={} phase=held-out-evaluation status=completed return={}'.format(

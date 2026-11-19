@@ -16,6 +16,9 @@ from harl.envs.cascade_reservoir.evaluation import episode_constraint_status
 from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 from harl.envs.cascade_reservoir.trajectory_diagnostics import (
     TrajectoryDiagnosticsWriter, TRAJECTORY_DIAGNOSTIC_FIELDS)
+from harl.envs.cascade_reservoir.daily_change_diagnostics import (
+    DAILY_CHANGE_FIELDS, STATISTICS_FIELDS, daily_change_output_paths,
+    flatten_output_paths, write_daily_change_csv, write_level_change_statistics_csv)
 from harl.runners.cascade_reservoir_runner import (
     CascadeReservoirRunner, value_normalization_update_schedule)
 from harl.envs.cascade_reservoir.cascade_reservoir_env import (
@@ -135,6 +138,40 @@ def plot_output_paths(episode_log=None, plot_output=None):
                 violations=path.with_name(path.stem+'_violation_rates.png'))
 
 
+def daily_change_output_directory(plot_output=None, episode_log=None):
+    """Place automatic daily diagnostics beside the requested run figures."""
+    source = plot_output if plot_output is not None else episode_log
+    return None if source is None else Path(source).parent
+
+
+def daily_change_paths(plot_output=None, episode_log=None, seeds=(), algorithm='happo',
+                       directory=None):
+    """Reserve per-seed CSVs and four figures without depending on --no-plot."""
+    if directory is None:
+        directory = daily_change_output_directory(plot_output, episode_log)
+    return daily_change_output_paths(directory, seeds, algorithm)
+
+
+def save_daily_change_outputs(runners, paths, plot_python, verbose_console=False):
+    """Save raw evidence before plotting, then render four figures for each seed."""
+    if set(paths) != {runner.seed for runner in runners}:
+        raise ValueError('Daily-change outputs require one path set for every evaluated seed')
+    for runner in runners:
+        series = getattr(runner, 'final_evaluation_daily_series', None)
+        if not isinstance(series, dict) or series.get('seed') != runner.seed:
+            raise ValueError('Final held-out evaluation did not retain daily level and release data')
+        files = paths[runner.seed]
+        write_daily_change_csv(files['csv'], series)
+        write_level_change_statistics_csv(files['statistics_csv'], runner.seed,
+                                          series['levels_end'])
+        subprocess.run([plot_python, str(ROOT/'examples/plot_daily_change_diagnostics.py'),
+            '--input', str(files['csv']),
+            '--output-stem', str(files['csv'].with_name(files['csv'].name[:-len('_daily_changes.csv')]))],
+            check=True, stdout=None if verbose_console else subprocess.DEVNULL)
+    return {str(seed):{name:str(path.resolve()) for name,path in files.items()}
+            for seed,files in paths.items()}
+
+
 def trajectory_diagnostics_paths(episode_log, seeds, enabled=False):
     """Optional linked daily learning signals, kept separate from legacy metrics."""
     if not enabled or episode_log is None:
@@ -176,6 +213,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         if not isinstance(algorithm_name,str) or algorithm_name.lower() not in ('happo','mappo'):
             raise ValueError('algorithm_name must be happo or mappo')
         algorithm_name=algorithm_name.lower()
+    run_algorithm=algorithm_name or getattr(runner_cls,'algorithm_name','happo')
     correctness_dir = getattr(args, 'correctness_output', None)
     correctness_enabled = correctness_dir is not None
     if correctness_enabled and getattr(runner_cls, 'algorithm_name', 'happo') != 'happo':
@@ -215,9 +253,15 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     credit_paths=counterfactual_credit_paths(args.episode_log,config['experiment']['seeds'],credit_mode=='counterfactual')
     figure_paths={} if args.no_plot else plot_output_paths(
         args.episode_log, getattr(args, 'plot_output', None))
+    daily_change_paths_by_seed=({} if args.skip_final_evaluation else daily_change_paths(
+        getattr(args, 'plot_output', None), args.episode_log,
+        config['experiment']['seeds'], run_algorithm,
+        directory=getattr(args, 'daily_change_output', None)))
+    daily_change_directory=(None if not daily_change_paths_by_seed else
+        next(iter(daily_change_paths_by_seed.values()))['csv'].parent)
     periodic_windows=select_periodic_windows(data)
     output_paths=(([] if args.episode_log is None else [args.episode_log])+
-                  list(daily_paths.values())+list(figure_paths.values())+
+                  flatten_output_paths(daily_change_paths_by_seed)+list(figure_paths.values())+
                   list(trajectory_paths.values())+list(checkpoint_dirs.values())+list(credit_paths.values()))
     validate_correctness_output(correctness_dir, output_paths)
     if len({path.resolve() for path in output_paths}) != len(output_paths):
@@ -355,6 +399,22 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             output='one CSV per seed; JSONL contains summaries and configuration'),
         evaluation='held-out representative years in configured order; storage carries across boundaries; '
                    'one sequence scored after training, without policy ranking',
+        daily_change_diagnostics=dict(
+            enabled=bool(daily_change_paths_by_seed), automatic=True,
+            source='executed days of each seed final held-out evaluation policy trajectory',
+            output_directory=(None if daily_change_directory is None
+                              else str(daily_change_directory.resolve())),
+            values='actual end-of-day level and actual total daily release from the evaluation transition',
+            difference_rule='current minus previous in episode order; first daily difference is missing; '
+                            'source-year joins are not reset',
+            level_unit='m/day', release_unit='m3/s/day',
+            files={str(seed):{name:str(path.resolve()) for name,path in files.items()}
+                   for seed,files in daily_change_paths_by_seed.items()},
+            raw_csv_columns=list(DAILY_CHANGE_FIELDS),
+            statistics_csv_columns=list(STATISTICS_FIELDS),
+            statistics='mean, linearly interpolated P95, and maximum of finite |delta level|; first step excluded',
+            plotting='four separate PNG files per seed saved without windows opening',
+            role='observational diagnostics only; no learning reward, observation, optimizer or physical constraint change'),
         config=config,physical_config=physical,
         service_requirements=(data.service_requirements.metadata()
                               if data.service_requirements is not None else None),
@@ -412,6 +472,10 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         subprocess.run([args.plot_python,str(ROOT/'examples/plot_cascade_correctness.py'),
                         '--check-backend'],check=True,
                        stdout=None if verbose_console else subprocess.DEVNULL)
+    if daily_change_paths_by_seed:
+        subprocess.run([args.plot_python,str(ROOT/'examples/plot_daily_change_diagnostics.py'),
+                        '--check-backend'],check=True,
+                       stdout=None if verbose_console else subprocess.DEVNULL)
     if not args.no_plot:
         subprocess.run([args.plot_python,str(ROOT/'examples/plot_cascade.py'),'--check-backend'],check=True,
                        stdout=None if verbose_console else subprocess.DEVNULL)
@@ -445,6 +509,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             runner.run(episodes,interval)
             runners.append(runner)
         evaluations=[]
+        daily_change_files={}
         if not args.skip_final_evaluation:
             try:
                 for runner in runners:
@@ -460,6 +525,11 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                         print('Correctness output failed after evaluation failure: '+str(output_error),
                               file=sys.stderr)
                 raise
+        if daily_change_paths_by_seed:
+            daily_change_files=save_daily_change_outputs(
+                runners, daily_change_paths_by_seed, args.plot_python, verbose_console)
+            print('Daily level/release change CSV and figures saved to '+
+                  str(daily_change_directory.resolve()),flush=True)
         result=dict(record_type='run_complete',seeds=config['experiment']['seeds'],
             episode_horizon_days=days,parallel_environments=count,episodes_per_seed=episodes,
             training_steps_per_seed=[runner.training_steps for runner in runners],
@@ -472,7 +542,10 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             final_policy_metadata=[runner.evaluation_policy_metadata() for runner in runners],
             policy_checkpoints=[checkpoint for runner in runners for checkpoint in runner.checkpoint_history],
             evaluation_skipped=bool(args.skip_final_evaluation),evaluations=evaluations,
-            learning_objective=learning_objective)
+            learning_objective=learning_objective,
+            daily_change_diagnostics=dict(enabled=bool(daily_change_files),
+                files=daily_change_files,
+                difference_rule='current minus previous in episode order; first daily difference is missing'))
         log_episode(result,stream,console=verbose_console)
         if correctness_enabled:
             save_correctness_outputs(runners, metadata, evaluations, correctness_dir, args.plot_python)
@@ -482,7 +555,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             histories=[runner.training_history for runner in runners],
             evaluation_histories=[runner.periodic_evaluation_history for runner in runners],
             algorithm=algorithm_name or 'happo',comparison_context=comparison_context,
-            actor_architecture=actor_architecture,learning_objective=learning_objective),allow_nan=False))
+            actor_architecture=actor_architecture,learning_objective=learning_objective,
+            daily_change_diagnostics=dict(enabled=bool(daily_change_files),
+                files=daily_change_files)),allow_nan=False))
         if not args.no_plot:
             plot_command=[args.plot_python,str(ROOT/'examples/plot_cascade_parallel.py')]
             if figure_paths:
@@ -496,6 +571,8 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         print('Finished multi-year experiment. Training resume is not implemented; '
               'evaluation checkpoints are saved when --save-checkpoints is enabled. '
               'JSONL summaries and per-seed daily metrics CSVs are saved with --episode-log. '
+              'Daily level/release change CSVs and four figures per seed are saved beside '
+              '--plot-output or --episode-log. '
               'Figures are saved with --plot-output or --episode-log when plotting is enabled.',flush=True)
     else:
         print('Finished multi-year experiment.' + (' Summaries: '+str(args.episode_log.resolve())

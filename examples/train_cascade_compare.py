@@ -17,7 +17,8 @@ from examples.train_cascade import main as cascade_main
 from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths,
     trajectory_diagnostics_paths, checkpoint_directories,
-    counterfactual_credit_paths, validate_correctness_output)
+    counterfactual_credit_paths, validate_correctness_output,
+    daily_change_paths, flatten_output_paths)
 from examples.plot_cascade_compare import validate_comparison
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 from harl.runners.cascade_mappo_runner import CascadeMAPPORunner
@@ -64,6 +65,8 @@ def comparison_preflight(args, config):
         raise ValueError('HAPPO retains five independent actors; its share_param must be false')
     paths = [] if args.episode_log is None else [Path(args.episode_log)]
     seeds = config['experiment']['seeds']
+    explicit_daily_directory = (None if getattr(args, 'plot_output', None) is None
+                                else Path(args.plot_output).parent)
     for algorithm in algorithms:
         log = algorithm_log_path(args.episode_log, algorithm)
         if log is not None:
@@ -72,6 +75,9 @@ def comparison_preflight(args, config):
         paths.extend(trajectory_diagnostics_paths(log, seeds, args.trajectory_diagnostics).values())
         paths.extend(checkpoint_directories(log, seeds, args.save_checkpoints).values())
         paths.extend(counterfactual_credit_paths(log, seeds, counterfactual).values())
+        if not getattr(args, 'skip_final_evaluation', False):
+            paths.extend(flatten_output_paths(daily_change_paths(
+                None, log, seeds, algorithm, directory=explicit_daily_directory)))
     if not args.no_plot:
         paths.extend(plot_output_paths(args.episode_log, getattr(args, 'plot_output', None)).values())
     validate_correctness_output(getattr(args, 'correctness_output', None), paths)
@@ -86,6 +92,8 @@ def comparison_preflight(args, config):
 def run_comparison(data, physical, config, args):
     """Run fresh models, optimizers and paired samplers for each algorithm."""
     comparison_preflight(args, config)
+    explicit_daily_directory = (None if getattr(args, 'plot_output', None) is None
+                                else Path(args.plot_output).parent)
     if not args.no_plot and not args.check_data_only:
         subprocess.run([args.plot_python, str(ROOT/'examples/plot_cascade.py'),
                         '--check-backend'], check=True,
@@ -96,6 +104,7 @@ def run_comparison(data, physical, config, args):
         options.episode_log = algorithm_log_path(args.episode_log, algorithm)
         options.no_plot = True  # Only the joint figures are drawn at the end.
         options.plot_output = None
+        options.daily_change_output = explicit_daily_directory
         print('Running {} with the shared cascade configuration ...'.format(
               algorithm.upper()), flush=True)
         effective_config = copy.deepcopy(config)

@@ -32,8 +32,10 @@ python -B examples/train_cascade_compare.py \
 The default comparison runs both algorithms; select `--algorithms happo` or
 `--algorithms mappo` to run one. `examples/train_cascade.py` remains the HAPPO
 entry point. The episode budget applies separately to each algorithm and seed.
-`--no-plot` disables figures. `--plot-python PATH` selects another interpreter
-with Matplotlib. Existing output files are never overwritten.
+`--no-plot` disables the legacy training/comparison figures and plot windows.
+Automatic daily level/release diagnostics are still saved when `--episode-log`
+provides a run directory. `--plot-python PATH` selects another interpreter with
+Matplotlib. Existing output files are never overwritten.
 
 By default results stay in memory. Add a fresh `--episode-log` path to retain
 JSONL summaries and per-seed daily CSVs. For comparison runs that path is a stem:
@@ -204,6 +206,25 @@ python -B examples/plot_cascade_compare.py \
 Plot validators check scenario identities, data hashes, physical settings and
 training budgets. Forecast input hashes identify current actor dimensions while
 older logs without that input retain their original dimensions.
+
+## Automatic daily change diagnostics
+
+Every run with a final held-out evaluation and either `--plot-output` or
+`--episode-log` saves daily level and release diagnostics beside that output.
+With the timestamped `--plot-output "$run_dir/curves"` pattern, files go directly
+in `$run_dir`. Each seed gets one raw CSV, one level-statistics CSV, and four PNGs:
+`daily_level_change.png`, `abs_level_change_heatmap.png`,
+`level_change_statistics.png`, and `daily_release_change.png` (prefixed by the
+algorithm and seed). The first daily difference is an empty CSV cell; all later
+differences are current minus previous in episode order. Nonconsecutive held-out
+year joins are retained on the actual-date axis, while the level difference across
+each join remains part of the continuous evaluation sequence.
+
+The figures show five reservoir panels per seed. The heatmap uses actual calendar
+year and day-of-year, including leap days. The statistics panels and summary CSV
+report mean, linearly interpolated P95, and maximum `|ΔZ|`. These diagnostics read
+executed end-of-day levels and daily releases only; they do not alter observations,
+rewards, actions, constraints, or optimization.
 
 ## Correctness figures
 
