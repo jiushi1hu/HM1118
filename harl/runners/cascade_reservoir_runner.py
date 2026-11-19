@@ -17,6 +17,7 @@ from harl.envs.cascade_reservoir.evaluation import evaluate_policy, episode_cons
 from harl.envs.cascade_reservoir.periodic_evaluation import (
     evaluate_periodic_policy, select_periodic_windows)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
+from harl.envs.cascade_reservoir.level_ramp import conflicts_from_exception
 from harl.envs.cascade_reservoir.counterfactual_credit import validate_credit_assignment
 from harl.envs.cascade_reservoir.reward import (
     ACTOR_REWARD_DEFINITION, SYSTEM_REWARD_DEFINITION, EpisodeRewardMetrics,
@@ -71,7 +72,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     def __init__(self, data, physical_config, algo_args, seed, episode_log=None, step_log=None,
                  periodic_windows=None, training_sampler=None,
                  trajectory_log=None, checkpoint_dir=None, counterfactual_log=None,
-                 correctness_enabled=False):
+                 correctness_enabled=False, ramp_conflict_log=None):
         seed = validate_seed(seed)
         self.data, self.physical_config = data, physical_config
         self.requested_args = copy.deepcopy(algo_args)
@@ -88,6 +89,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.counterfactual_credit = self.counterfactual_advantages = None
         self.counterfactual_context = self.counterfactual_probabilities = None
         self.counterfactual_log = counterfactual_log
+        self.ramp_conflict_log = ramp_conflict_log
         if counterfactual_log is not None and self.credit_assignment != 'counterfactual':
             raise ValueError('Counterfactual traces require counterfactual credit assignment')
         validate_value_normalization(args['algo']['use_clipped_value_loss'], args['train']['use_valuenorm'])
@@ -169,6 +171,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.last_reward_metrics = EpisodeRewardMetrics(args['algo']['gamma']).summary()
         self.training_history, self.episode_history, self.diagnostics_history = [], [], []
         self.periodic_evaluation_history = []
+        self.ramp_conflict_history = []
         self.episode_log = episode_log
         self.verbose_console = args['experiment'].get('verbose_console', False)
         if not isinstance(self.verbose_console, bool):
@@ -200,6 +203,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     def _log_record(self, record):
         log_episode(record, self.episode_log, console=getattr(self, 'verbose_console', False))
+
+    def _log_ramp_conflicts(self, conflicts, phase, **context):
+        if conflicts:
+            self.ramp_conflict_history.extend(dict(value) for value in conflicts)
+            if self.ramp_conflict_log is not None:
+                self.ramp_conflict_log.write(conflicts, phase, **context)
 
     def _progress_return(self, record=None):
         """Display the actual learning objective rather than legacy accounting."""
@@ -397,6 +406,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 largest_residual = max(largest_residual,
                     max(float(np.abs(r['residual']).max()) for r in transitions))
         except Exception as exc:
+            ramp_conflicts = conflicts_from_exception(exc)
+            self._log_ramp_conflicts(ramp_conflicts, 'training',
+                window_start_year=years[0], episode_step=t+1,
+                policy_update=self.update_count+1)
             self._log_collected_steps(getattr(exc, 'successful_step_results', []), ids, t)
             for record in getattr(exc, 'episode_records', []):
                 self.hard_failed_episodes += 1
@@ -406,6 +419,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 self._log_record(record)
             self._log_record(dict(record_type='training_sampling_aborted', seed=self.seed,
                 attempted_window_starts=years, cause=str(exc),
+                ramp_conflict_count=len(ramp_conflicts),
+                ramp_conflicts=ramp_conflicts,
                 completed_training_coverage=self.training_coverage_summary(),
                 coverage_scope='successfully collected full batches only; this failed batch is excluded'))
             self.close()
@@ -618,6 +633,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 episode=self.completed_episodes, policy_update=self.update_count,
                 training_steps=self.training_steps, scenario=selected,
                 gamma=self.algo_args['algo']['gamma'])
+        for window in record.get('windows', []):
+            if window.get('status') == 'failed':
+                self._log_ramp_conflicts(
+                    window.get('failure', {}).get('conflicts', []),
+                    'training_evaluation', policy_update=self.update_count,
+                    episode_step=window.get('failure', {}).get('episode_step'))
         self._annotate_learning_rewards(record)
         self.periodic_evaluation_history.append(record)
         self._log_record(record)
@@ -657,6 +678,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     step_log=self.step_log,transition_observer=daily_recorder.capture)
         except InfeasibleCascade as exc:
             progress = getattr(exc, 'evaluation_progress', {})
+            ramp_conflicts = conflicts_from_exception(exc)
+            self._log_ramp_conflicts(ramp_conflicts, 'final_evaluation',
+                episode_step=progress.get('episode_step', 1),
+                policy_update=self.update_count)
             self._log_record(self._annotate_learning_rewards(dict(record_type='final_evaluation_sequence', phase='evaluation',
                 seed=self.seed, episode=self.completed_episodes, training_steps=self.training_steps,
                 evaluation_source_years=years, episode_horizon_days=self.length,
@@ -666,7 +691,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 failure=dict(error_type=type(exc).__name__, reason=str(exc),
                     date=progress.get('date', str(years[0])+'-01-01'),
                     episode_step=progress.get('episode_step', 1),
-                    completed_steps=progress.get('completed_steps', 0)),
+                    completed_steps=progress.get('completed_steps', 0),
+                    conflicts=ramp_conflicts),
                 partial_metrics=progress.get('partial_metrics', {}),
                 episode_reward=None, energy_MWh=None, energy_TWh=None, **metadata)))
             raise  # Preserve the existing final-evaluation stop-on-failure behavior.

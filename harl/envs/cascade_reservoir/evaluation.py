@@ -77,6 +77,8 @@ def _attach_evaluation_progress(error, env, rewards, energy):
             generation_MWh=float(energy), generation_TWh=float(energy/1e6),
             ecological_flow_penalty=totals['episode_penalty_ecological_flow']))
     error.evaluation_progress.update(storage_change_summary(env.initial_storage, env.storage))
+    error.evaluation_progress['conflicts'] = [dict(value)
+        for value in getattr(error, 'conflicts', [])]
 
 
 @torch.no_grad()

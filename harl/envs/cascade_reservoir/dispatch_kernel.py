@@ -1,12 +1,27 @@
 """Shared scalar/batch release dispatch under current physical constraints."""
 import numpy as np
+from harl.envs.cascade_reservoir.data_loader import IDS
 
 
 FLOW_TOLERANCE = 1e-8
 
 
 class InfeasibleCascade(RuntimeError):
-    pass
+    """A physical infeasibility that may carry machine-readable evidence."""
+
+    def __init__(self, message, conflicts=None):
+        super().__init__(message)
+        self.conflicts = [] if conflicts is None else [dict(value) for value in conflicts]
+
+
+def _release_conflicts(lower, upper, failed, reason):
+    records = []
+    for row, reservoir in zip(*np.where(failed)):
+        records.append(dict(row=int(row), reservoir=IDS[int(reservoir)],
+            reservoir_index=int(reservoir), reason=reason,
+            release_lower_m3s=float(lower[row, reservoir]),
+            release_upper_m3s=float(upper[row, reservoir])))
+    return records
 
 
 def _matrix(value, name, shape=None):
@@ -66,7 +81,9 @@ def dispatch_release(storage, external, actions, storage_lower, storage_upper,
     physical_lower, physical_upper, physical_conflict = _backward(
         storage, external, storage_lower, storage_upper, cap, dt)
     if physical_conflict.any():
-        raise InfeasibleCascade('Empty physically compatible release interval')
+        raise InfeasibleCascade('Empty physically compatible release interval',
+            conflicts=_release_conflicts(physical_lower, physical_upper,
+                physical_conflict, 'cascade_storage_compatibility'))
     lower, upper = physical_lower, physical_upper
     inflow, release, low, high = [np.empty(shape) for _ in range(4)]
     controls = np.ones(shape, dtype=np.float32)
@@ -76,7 +93,13 @@ def dispatch_release(storage, external, actions, storage_lower, storage_upper,
         low[:, i] = np.maximum(lower[:, i], inflow[:, i]+(storage[:, i]-storage_upper[:, i])/dt)
         high[:, i] = np.minimum(upper[:, i], inflow[:, i]+(storage[:, i]-storage_lower[:, i])/dt)
         if (low[:, i] > high[:, i]+FLOW_TOLERANCE).any():
-            raise InfeasibleCascade('Empty feasible release interval at reservoir '+str(i))
+            failed = (low[:, i] > high[:, i]+FLOW_TOLERANCE)
+            raise InfeasibleCascade('Empty feasible release interval at reservoir '+str(i),
+                conflicts=[dict(row=int(row), reservoir=IDS[i], reservoir_index=int(i),
+                    reason='reservoir_release_interval',
+                    release_lower_m3s=float(low[row, i]),
+                    release_upper_m3s=float(high[row, i]))
+                    for row in np.flatnonzero(failed)])
         collapsed = high[:, i]-low[:, i] <= FLOW_TOLERANCE
         controls[collapsed, i] = 0.
         executed[collapsed, i] = .5

@@ -14,13 +14,15 @@ import numpy as np
 from harl.envs.cascade_reservoir.data_loader import IDS
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DAILY_CHANGE_FIELDS = (
     'seed', 'date', 'year', 'day_of_year', 'reservoir', 'level_m',
-    'delta_level_m', 'abs_delta_level_m', 'release_m3s', 'delta_release_m3s')
+    'delta_level_m', 'abs_delta_level_m', 'release_m3s', 'delta_release_m3s',
+    'rise_limit_m_per_day', 'fall_limit_m_per_day', 'within_ramp_limit')
 STATISTICS_FIELDS = (
     'seed', 'reservoir', 'sample_count', 'mean_abs_delta_level_m',
-    'p95_abs_delta_level_m', 'max_abs_delta_level_m')
+    'p95_abs_delta_level_m', 'max_abs_delta_level_m',
+    'max_abs_allowed_level_change_m', 'ramp_violation_count')
 FIGURE_SUFFIXES = {
     'daily_level_change': '_daily_level_change.png',
     'level_change_heatmap': '_abs_level_change_heatmap.png',
@@ -56,7 +58,32 @@ def _matrix(value, name, days=None):
     return result
 
 
-def validate_daily_series(dates, levels, releases, expected_steps=None):
+def _optional_limits(value, name, days):
+    if value is None:
+        return None
+    result = _matrix(value, name, days)
+    if (result < 0.).any():
+        raise ValueError(name+' must be nonnegative')
+    return result
+
+
+def ramp_compliance(level_change, rise_limit, fall_limit):
+    """Return one explicit within-limit flag per reservoir-day."""
+    level_change = np.asarray(level_change, dtype=np.float64)
+    if (level_change.ndim != 2 or level_change.shape[1] != len(IDS) or
+            np.isinf(level_change).any()):
+        raise ValueError('delta_level_m must be a (days, 5) matrix with no infinities')
+    rise_limit = _matrix(rise_limit, 'rise_limit_m_per_day', len(level_change))
+    fall_limit = _matrix(fall_limit, 'fall_limit_m_per_day', len(level_change))
+    result = np.zeros(level_change.shape, dtype=bool)
+    finite = np.isfinite(level_change)
+    result[finite] = ((level_change[finite] <= rise_limit[finite]+1e-8) &
+                      (level_change[finite] >= -fall_limit[finite]-1e-8))
+    return result
+
+
+def validate_daily_series(dates, levels, releases, expected_steps=None,
+                          rise_limits=None, fall_limits=None):
     """Validate one reservoir-major daily sequence without imposing year order.
 
     Held-out years may be nonconsecutive and even move backwards at a source-year
@@ -72,7 +99,11 @@ def validate_daily_series(dates, levels, releases, expected_steps=None):
         raise ValueError('Daily diagnostic sequence does not contain every expected evaluation day')
     levels = _matrix(levels, 'levels_end', len(parsed))
     releases = _matrix(releases, 'release', len(parsed))
-    return parsed, levels, releases
+    rise_limits = _optional_limits(rise_limits, 'rise_limit_m_per_day', len(parsed))
+    fall_limits = _optional_limits(fall_limits, 'fall_limit_m_per_day', len(parsed))
+    if (rise_limits is None) != (fall_limits is None):
+        raise ValueError('Rise and fall ramp limits must be saved together')
+    return parsed, levels, releases, rise_limits, fall_limits
 
 
 def daily_changes(levels, releases):
@@ -89,11 +120,17 @@ def daily_changes(levels, releases):
     return level_change, release_change
 
 
-def level_change_statistics(levels):
+def level_change_statistics(levels, rise_limits=None, fall_limits=None):
     """Summarize finite absolute level changes independently for five reservoirs."""
     levels = _matrix(levels, 'levels_end')
     change, _ = daily_changes(levels, np.zeros_like(levels))
     magnitude = np.abs(change)
+    rise_limits = _optional_limits(rise_limits, 'rise_limit_m_per_day', len(levels))
+    fall_limits = _optional_limits(fall_limits, 'fall_limit_m_per_day', len(levels))
+    if (rise_limits is None) != (fall_limits is None):
+        raise ValueError('Rise and fall ramp limits must be supplied together')
+    within = (ramp_compliance(change, rise_limits, fall_limits)
+              if rise_limits is not None else None)
     rows = []
     for index, reservoir in enumerate(IDS):
         values = magnitude[1:, index]
@@ -101,7 +138,12 @@ def level_change_statistics(levels):
         rows.append(dict(reservoir=reservoir, sample_count=int(len(values)),
             mean_abs_delta_level_m=(float(np.mean(values)) if len(values) else None),
             p95_abs_delta_level_m=(float(np.percentile(values, 95)) if len(values) else None),
-            max_abs_delta_level_m=(float(np.max(values)) if len(values) else None)))
+            max_abs_delta_level_m=(float(np.max(values)) if len(values) else None),
+            max_abs_allowed_level_change_m=(float(np.max(np.maximum(
+                rise_limits[1:, index], fall_limits[1:, index])))
+                if rise_limits is not None and len(levels) > 1 else None),
+            ramp_violation_count=(int(np.sum(~within[1:, index]))
+                if within is not None else None)))
     return rows
 
 
@@ -121,10 +163,14 @@ def write_daily_change_csv(path, trajectory):
     """Write one exclusive per-seed table; the first delta in each channel is empty."""
     path = Path(path)
     seed = _integer(trajectory.get('seed'), 'seed')
-    dates, levels, releases = validate_daily_series(
+    dates, levels, releases, rise_limits, fall_limits = validate_daily_series(
         trajectory.get('dates', ()), trajectory.get('levels_end', ()),
-        trajectory.get('release', ()), trajectory.get('steps'))
+        trajectory.get('release', ()), trajectory.get('steps'),
+        trajectory.get('ramp_rise_limit_m_per_day'),
+        trajectory.get('ramp_fall_limit_m_per_day'))
     level_change, release_change = daily_changes(levels, releases)
+    within = (ramp_compliance(level_change, rise_limits, fall_limits)
+              if rise_limits is not None else None)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('x', encoding='utf-8', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=DAILY_CHANGE_FIELDS)
@@ -138,15 +184,21 @@ def write_daily_change_csv(path, trajectory):
                     delta_level_m=_csv_value(level_delta),
                     abs_delta_level_m=_csv_value(abs(level_delta) if np.isfinite(level_delta) else None),
                     release_m3s=_csv_value(releases[day_index, reservoir_index]),
-                    delta_release_m3s=_csv_value(release_change[day_index, reservoir_index])))
+                    delta_release_m3s=_csv_value(release_change[day_index, reservoir_index]),
+                    rise_limit_m_per_day=(_csv_value(rise_limits[day_index, reservoir_index])
+                        if rise_limits is not None else ''),
+                    fall_limit_m_per_day=(_csv_value(fall_limits[day_index, reservoir_index])
+                        if fall_limits is not None else ''),
+                    within_ramp_limit=(_csv_value(int(within[day_index, reservoir_index]))
+                        if within is not None and np.isfinite(level_delta) else '')))
     return path
 
 
-def write_level_change_statistics_csv(path, seed, levels):
+def write_level_change_statistics_csv(path, seed, levels, rise_limits=None, fall_limits=None):
     """Write the same mean/P95/max values displayed by the statistics figure."""
     path = Path(path)
     seed = _integer(seed, 'seed')
-    rows = level_change_statistics(levels)
+    rows = level_change_statistics(levels, rise_limits, fall_limits)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('x', encoding='utf-8', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=STATISTICS_FIELDS)
@@ -156,7 +208,10 @@ def write_level_change_statistics_csv(path, seed, levels):
                 sample_count=row['sample_count'],
                 mean_abs_delta_level_m=_csv_value(row['mean_abs_delta_level_m']),
                 p95_abs_delta_level_m=_csv_value(row['p95_abs_delta_level_m']),
-                max_abs_delta_level_m=_csv_value(row['max_abs_delta_level_m'])))
+                max_abs_delta_level_m=_csv_value(row['max_abs_delta_level_m']),
+                max_abs_allowed_level_change_m=_csv_value(
+                    row['max_abs_allowed_level_change_m']),
+                ramp_violation_count=_csv_value(row['ramp_violation_count'])))
     return path
 
 
@@ -168,7 +223,7 @@ def daily_change_figure_paths(stem):
 
 
 def daily_change_output_paths(directory, seeds, algorithm='happo'):
-    """Reserve one raw CSV, one summary CSV and four figures for every seed."""
+    """Reserve two data CSVs, one conflict CSV and four figures per seed."""
     if directory is None:
         return {}
     directory = Path(directory)
@@ -180,7 +235,8 @@ def daily_change_output_paths(directory, seeds, algorithm='happo'):
         seed = _integer(seed, 'seed')
         stem = directory/(algorithm+'_seed'+str(seed))
         paths = dict(csv=stem.with_name(stem.name+'_daily_changes.csv'),
-                     statistics_csv=stem.with_name(stem.name+'_level_change_statistics.csv'))
+                     statistics_csv=stem.with_name(stem.name+'_level_change_statistics.csv'),
+                     ramp_conflicts_csv=stem.with_name(stem.name+'_ramp_conflicts.csv'))
         paths.update(daily_change_figure_paths(stem))
         result[seed] = paths
     return result
@@ -196,6 +252,7 @@ class DailyChangeRecorder:
     def __init__(self, seed):
         self.seed = _integer(seed, 'seed')
         self.dates, self.levels, self.releases = [], [], []
+        self.rise_limits, self.fall_limits = [], []
 
     def capture(self, transition):
         if not isinstance(transition, dict):
@@ -209,17 +266,37 @@ class DailyChangeRecorder:
             raise ValueError('levels_end must be a finite five-vector')
         if release.shape != (len(IDS),) or not np.isfinite(release).all():
             raise ValueError('release must be a finite five-vector')
+        rise = transition.get('ramp_rise_limit_m_per_day')
+        fall = transition.get('ramp_fall_limit_m_per_day')
+        if (rise is None) != (fall is None):
+            raise ValueError('A transition must provide both rise and fall ramp limits')
+        if rise is not None:
+            rise = np.asarray(rise, dtype=np.float64)
+            fall = np.asarray(fall, dtype=np.float64)
+            if (rise.shape != (len(IDS),) or fall.shape != (len(IDS),) or
+                    not np.isfinite(rise).all() or not np.isfinite(fall).all() or
+                    (rise < 0.).any() or (fall < 0.).any()):
+                raise ValueError('Transition ramp limits must be nonnegative finite five-vectors')
         self.dates.append(day.isoformat())
         self.levels.append(level.tolist())
         self.releases.append(release.tolist())
+        self.rise_limits.append(None if rise is None else rise.tolist())
+        self.fall_limits.append(None if fall is None else fall.tolist())
 
     def finish(self, expected_steps=None):
-        dates, levels, releases = validate_daily_series(
-            self.dates, self.levels, self.releases, expected_steps)
+        has_limits = bool(self.rise_limits) and self.rise_limits[0] is not None
+        if any((value is not None) != has_limits for value in self.rise_limits):
+            raise ValueError('Every evaluation transition must use the same ramp-limit availability')
+        dates, levels, releases, rise_limits, fall_limits = validate_daily_series(
+            self.dates, self.levels, self.releases, expected_steps,
+            self.rise_limits if has_limits else None,
+            self.fall_limits if has_limits else None)
         return dict(schema_version=SCHEMA_VERSION,
             record_type='evaluation_daily_change_series', seed=self.seed,
             steps=len(dates), dates=[day.isoformat() for day in dates],
             levels_end=levels.tolist(), release=releases.tolist(),
+            ramp_rise_limit_m_per_day=(None if rise_limits is None else rise_limits.tolist()),
+            ramp_fall_limit_m_per_day=(None if fall_limits is None else fall_limits.tolist()),
             level_timestamp='levels_end is the actual end-of-day level after each dated daily action',
             release_timestamp='release is the actual total daily release for each dated action',
             difference_rule='current minus previous in episode order; first daily difference is missing; '

@@ -34,6 +34,16 @@ def _number(value, field, allow_missing=False):
     return result
 
 
+def _flag(value, field, allow_missing=False):
+    if value in ('', None):
+        if allow_missing:
+            return None
+        raise ValueError(field+' is missing')
+    if value not in ('0', '1'):
+        raise ValueError(field+' must be 0 or 1')
+    return value == '1'
+
+
 def _consecutive_runs(days):
     """Split actual dates where source years are not adjacent in calendar time."""
     for index in range(1, len(days)):
@@ -60,6 +70,9 @@ def load_daily_change_csv(path):
     deltas = np.full((days, len(IDS)), np.nan, dtype=float)
     releases = np.empty((days, len(IDS)), dtype=float)
     release_deltas = np.full((days, len(IDS)), np.nan, dtype=float)
+    rise_limits = np.full((days, len(IDS)), np.nan, dtype=float)
+    fall_limits = np.full((days, len(IDS)), np.nan, dtype=float)
+    within_limits = np.full((days, len(IDS)), np.nan, dtype=float)
     for day_index in range(days):
         expected_day = None
         for reservoir_index, reservoir in enumerate(IDS):
@@ -80,6 +93,19 @@ def load_daily_change_csv(path):
             releases[day_index, reservoir_index] = _number(row['release_m3s'], 'release_m3s')
             delta = _number(row['delta_level_m'], 'delta_level_m', allow_missing=True)
             release_delta = _number(row['delta_release_m3s'], 'delta_release_m3s', allow_missing=True)
+            rise = _number(row['rise_limit_m_per_day'], 'rise_limit_m_per_day',
+                           allow_missing=True)
+            fall = _number(row['fall_limit_m_per_day'], 'fall_limit_m_per_day',
+                           allow_missing=True)
+            if (rise is None) != (fall is None):
+                raise ValueError('Rise and fall ramp limits must be present together')
+            if rise is not None:
+                if rise < 0. or fall < 0.:
+                    raise ValueError('Ramp limits must be nonnegative')
+                rise_limits[day_index, reservoir_index] = rise
+                fall_limits[day_index, reservoir_index] = fall
+            inside = _flag(row['within_ramp_limit'], 'within_ramp_limit',
+                           allow_missing=True)
             if day_index == 0:
                 if delta is not None or release_delta is not None:
                     raise ValueError('The first daily difference must be missing')
@@ -88,6 +114,15 @@ def load_daily_change_csv(path):
             else:
                 deltas[day_index, reservoir_index] = delta
                 release_deltas[day_index, reservoir_index] = release_delta
+                if rise is not None:
+                    expected_inside = (delta <= rise+1e-8 and delta >= -fall-1e-8)
+                    if inside is None or inside != expected_inside:
+                        raise ValueError('within_ramp_limit disagrees with delta and ramp limits')
+                    within_limits[day_index, reservoir_index] = int(inside)
+                elif inside is not None:
+                    raise ValueError('within_ramp_limit requires saved ramp limits')
+            if day_index == 0 and inside is not None:
+                raise ValueError('The first daily ramp-limit classification must be missing')
             magnitude = _number(row['abs_delta_level_m'], 'abs_delta_level_m', allow_missing=True)
             if delta is None:
                 if magnitude is not None:
@@ -98,7 +133,9 @@ def load_daily_change_csv(path):
         raise ValueError('Daily-change dates must be unique')
     return dict(seed=int(seed), dates=dates, years=years, day_of_year=day_of_year,
                 levels=levels, deltas=deltas, releases=releases,
-                release_deltas=release_deltas)
+                release_deltas=release_deltas, rise_limits=rise_limits,
+                fall_limits=fall_limits, within_limits=within_limits,
+                has_ramp_limits=bool(np.isfinite(rise_limits).any()))
 
 
 def _plot_broken_lines(ax, dates, values, label):
@@ -110,15 +147,42 @@ def _plot_broken_lines(ax, dates, values, label):
                 label=label if index == 0 else None)
 
 
+def _plot_broken_band(ax, dates, lower, upper):
+    """Draw seasonal/daily ramp envelopes without bridging source-year joins."""
+    starts = [0]+list(_consecutive_runs(dates))
+    stops = starts[1:]+[len(dates)]
+    for index, (start, stop) in enumerate(zip(starts, stops)):
+        selected_dates = dates[start:stop]
+        ax.fill_between(selected_dates, lower[start:stop], upper[start:stop],
+                        color='#2a9d8f', alpha=.12, linewidth=0.,
+                        label='applicable daily ramp envelope' if index == 0 else None)
+        ax.plot(selected_dates, upper[start:stop], color='#2a7f72', linewidth=.8,
+                label='rise limit' if index == 0 else None)
+        ax.plot(selected_dates, lower[start:stop], color='#9b4d96', linewidth=.8,
+                label='fall limit' if index == 0 else None)
+
+
 def make_daily_level_change_figure(series):
     figure, axes = plt.subplots(len(IDS), 1, figsize=(14, 11), sharex=True)
     figure.suptitle('Daily end-of-day water-level change · seed {}'.format(series['seed']))
     for index, (ax, reservoir) in enumerate(zip(axes, IDS)):
+        if series['has_ramp_limits']:
+            _plot_broken_band(ax, series['dates'], -series['fall_limits'][:, index],
+                              series['rise_limits'][:, index])
         _plot_broken_lines(ax, series['dates'], series['deltas'][:, index],
                            'current end-of-day level minus previous')
+        if series['has_ramp_limits']:
+            failed = np.flatnonzero(series['within_limits'][:, index] == 0.)
+            if len(failed):
+                ax.scatter([series['dates'][day] for day in failed],
+                           series['deltas'][failed, index], color='crimson', marker='x',
+                           s=22., zorder=5,
+                           label='outside hard ramp limit' if len(failed) else None)
         ax.axhline(0., color='0.35', linewidth=.8)
         ax.set_ylabel(reservoir+'\nΔZ (m/day)')
         ax.grid(alpha=.2)
+        if series['has_ramp_limits']:
+            ax.legend(frameon=False, fontsize=7, loc='upper right')
     axes[-1].xaxis.set_major_locator(mdates.YearLocator())
     axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(
         axes[-1].xaxis.get_major_locator()))
@@ -142,6 +206,9 @@ def make_level_change_heatmap_figure(series):
     matrices = [_heatmap_matrix(series, index)[1] for index in range(len(IDS))]
     finite = np.concatenate([matrix[np.isfinite(matrix)].ravel() for matrix in matrices])
     maximum = float(np.max(finite)) if finite.size else 1.
+    if series['has_ramp_limits']:
+        maximum = max(maximum, float(np.nanmax(np.maximum(
+            series['rise_limits'], series['fall_limits']))))
     if maximum <= 0.:
         maximum = 1.
     figure, axes = plt.subplots(len(IDS), 1, figsize=(14, 14), sharex=True, sharey=True,
@@ -155,6 +222,13 @@ def make_level_change_heatmap_figure(series):
         ax.set_ylabel(reservoir+'\nYear')
         ax.set_yticks(years)
         ax.tick_params(axis='y', labelsize=8)
+    if series['has_ramp_limits']:
+        for index, ax in enumerate(axes):
+            failed = np.flatnonzero(series['within_limits'][:, index] == 0.)
+            if len(failed):
+                ax.scatter(series['day_of_year'][failed], series['years'][failed],
+                           marker='x', s=12., color='#66d9ef', linewidths=.6,
+                           label='outside hard ramp limit')
     ticks = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
     axes[-1].set_xticks(ticks)
     axes[-1].set_xticklabels(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -173,7 +247,12 @@ def level_statistics(series):
         values = values[np.isfinite(values)]
         result.append(dict(reservoir=reservoir, mean=float(np.mean(values)),
             p95=float(np.percentile(values, 95)), maximum=float(np.max(values)),
-            sample_count=int(len(values))))
+            sample_count=int(len(values)),
+            allowed=(float(np.nanmax(np.maximum(series['rise_limits'][1:, reservoir_index],
+                series['fall_limits'][1:, reservoir_index])))
+                if series['has_ramp_limits'] else None),
+            violations=(int(np.sum(series['within_limits'][1:, reservoir_index] == 0.))
+                if series['has_ramp_limits'] else 0)))
     return result
 
 
@@ -195,6 +274,14 @@ def make_level_change_statistics_figure(series):
     ax.set_xticklabels(IDS)
     ax.set_ylabel('|ΔZ| (m/day)')
     ax.set_title('Daily water-level change statistics · seed {}'.format(series['seed']))
+    if series['has_ramp_limits']:
+        allowed = [row['allowed'] for row in statistics]
+        ax.scatter(x, allowed, marker='_', s=500, linewidths=2.5, color='black',
+                   label='largest applicable directional limit', zorder=5)
+        for index, row in enumerate(statistics):
+            ax.annotate('violations: {}'.format(row['violations']), (x[index], .03),
+                        xycoords=('data', 'axes fraction'), ha='center', va='bottom',
+                        fontsize=7, color='crimson')
     ax.margins(y=.14)
     ax.grid(axis='y', alpha=.2)
     ax.legend(frameon=False)

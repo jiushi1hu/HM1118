@@ -175,7 +175,8 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
                 result.update(status='failed', failure=dict(error_type=type(exc).__name__,
                     reason=str(exc), date=progress.get('date', window['start_date']),
                     episode_step=progress.get('episode_step', 1),
-                    completed_steps=progress.get('completed_steps', 0)),
+                    completed_steps=progress.get('completed_steps', 0),
+                    conflicts=progress.get('conflicts', [])),
                     partial_metrics=progress.get('partial_metrics', {}),
                     partial_storage_m3=progress.get('partial_storage_m3', window['initial_storage_m3']))
                 result.update({metric:None for metric in

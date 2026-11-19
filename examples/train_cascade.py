@@ -13,6 +13,7 @@ from harl.envs.cascade_reservoir.data_loader import (
     CascadeData, HEAD_MODELS, resolve_year_split, validate_service_scale)
 from harl.envs.cascade_reservoir.episodes import positive_integer
 from harl.envs.cascade_reservoir.reward import reward_settings, validate_discount_factor
+from harl.envs.cascade_reservoir.level_ramp import daily_level_ramp_limits
 from harl.envs.cascade_reservoir.training_sampler import SAMPLING_MODES, validate_sampling_mode
 from harl.runners.cascade_reservoir_runner import (
     validate_gae_lambda, validate_seed, validate_credit_assignment)
@@ -169,6 +170,7 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
             raise ValueError('use_daily_level_limits must be a boolean')
         for name in ('ecological_flow_scale',):
             physical[name] = validate_service_scale(physical.get(name,1.),name)
+        daily_level_ramp_limits(physical)
         reward_settings(physical)
         split = resolve_year_split(exp)
         exp.update({name:list(values) for name,values in split.items()})

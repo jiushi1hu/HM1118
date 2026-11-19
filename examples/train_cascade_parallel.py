@@ -19,6 +19,8 @@ from harl.envs.cascade_reservoir.trajectory_diagnostics import (
 from harl.envs.cascade_reservoir.daily_change_diagnostics import (
     DAILY_CHANGE_FIELDS, STATISTICS_FIELDS, daily_change_output_paths,
     flatten_output_paths, write_daily_change_csv, write_level_change_statistics_csv)
+from harl.envs.cascade_reservoir.level_ramp import (
+    RampConflictWriter, ensure_ramp_conflict_csv)
 from harl.runners.cascade_reservoir_runner import (
     CascadeReservoirRunner, value_normalization_update_schedule)
 from harl.envs.cascade_reservoir.cascade_reservoir_env import (
@@ -163,7 +165,9 @@ def save_daily_change_outputs(runners, paths, plot_python, verbose_console=False
         files = paths[runner.seed]
         write_daily_change_csv(files['csv'], series)
         write_level_change_statistics_csv(files['statistics_csv'], runner.seed,
-                                          series['levels_end'])
+            series['levels_end'], series.get('ramp_rise_limit_m_per_day'),
+            series.get('ramp_fall_limit_m_per_day'))
+        ensure_ramp_conflict_csv(files['ramp_conflicts_csv'], runner.seed)
         subprocess.run([plot_python, str(ROOT/'examples/plot_daily_change_diagnostics.py'),
             '--input', str(files['csv']),
             '--output-stem', str(files['csv'].with_name(files['csv'].name[:-len('_daily_changes.csv')]))],
@@ -386,6 +390,14 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         release_bounds_scope='current_transition',
         end_storage_policy='unconstrained_within_daily_operating_bounds',
         daily_bound_alignment='action_date=t constrains the state after action t; no additional date shift',
+        daily_level_ramp=dict(
+            enabled=bool(physical.get('daily_level_ramp_limits', {}).get('enabled', False)),
+            configuration=physical.get('daily_level_ramp_limits'),
+            enforcement='intersect the current level +/- rise/fall band with daily and operating bounds before release dispatch',
+            post_execution='verify the executed end-of-day level change; never clip storage or water level',
+            conflict_logs={str(seed):str(path) for seed,path in
+                           ((seed, files['ramp_conflicts_csv'])
+                            for seed,files in daily_change_paths_by_seed.items())}),
         step_logging=dict(enabled=args.episode_log is not None,
             format='compact_csv_v1',
             record_scope='one row per environment day; scalar team metrics over all five reservoirs',
@@ -484,6 +496,10 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         daily_writers={}
         trajectory_writers={}
         credit_writers={}
+        conflict_writers={seed:RampConflictWriter(files['ramp_conflicts_csv'], seed)
+                          for seed,files in daily_change_paths_by_seed.items()}
+        for writer in conflict_writers.values():
+            outputs.enter_context(writer)
         if args.episode_log is not None:
             args.episode_log.parent.mkdir(parents=True,exist_ok=True)
             stream=outputs.enter_context(args.episode_log.open('x',encoding='utf-8'))
@@ -505,7 +521,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                                           step_log=daily_writers.get(seed),periodic_windows=periodic_windows,
                                           training_sampler=training_samplers[seed],
                                           trajectory_log=trajectory_writers.get(seed),
-                                          checkpoint_dir=checkpoint_dirs.get(seed), **credit_options)
+                                          checkpoint_dir=checkpoint_dirs.get(seed),
+                                          ramp_conflict_log=conflict_writers.get(seed),
+                                          **credit_options)
             runner.run(episodes,interval)
             runners.append(runner)
         evaluations=[]
@@ -538,6 +556,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             periodic_evaluations_per_seed=[len(runner.periodic_evaluation_history) for runner in runners],
             periodic_evaluation_failures_per_seed=[sum(row['status']=='failed'
                 for row in runner.periodic_evaluation_history) for runner in runners],
+            ramp_conflicts_per_seed=[len(runner.ramp_conflict_history) for runner in runners],
             training_sampling_coverage_per_seed=[runner.training_coverage_summary() for runner in runners],
             final_policy_metadata=[runner.evaluation_policy_metadata() for runner in runners],
             policy_checkpoints=[checkpoint for runner in runners for checkpoint in runner.checkpoint_history],

@@ -21,6 +21,7 @@ from examples import train_cascade_parallel as parallel
 from examples import train_cascade as cli
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.envs.cascade_reservoir import daily_change_diagnostics as diagnostics
+from harl.envs.cascade_reservoir.level_ramp import CONFLICT_FIELDS
 from harl.envs.cascade_reservoir.periodic_evaluation import select_periodic_windows
 
 
@@ -49,9 +50,14 @@ def trajectory(seed=3, days=None):
         [20., 15., 41., 42., 60.],
         [25., 12., 46., 46., 65.],
         [5., 50., 100., 150., 200.]], dtype=float)
-    return dict(schema_version=1, seed=seed, steps=len(days),
+    rise_limits = np.full((len(days), 5), 100.)
+    fall_limits = np.full((len(days), 5), 100.)
+    fall_limits[:, 0] = 10.
+    return dict(schema_version=2, seed=seed, steps=len(days),
         dates=[day.isoformat() for day in days],
-        levels_end=levels.tolist(), release=releases.tolist()), levels, releases
+        levels_end=levels.tolist(), release=releases.tolist(),
+        ramp_rise_limit_m_per_day=rise_limits.tolist(),
+        ramp_fall_limit_m_per_day=fall_limits.tolist()), levels, releases
 
 
 def read_rows(path):
@@ -73,12 +79,19 @@ class DailyChangeDataTest(unittest.TestCase):
             self.assertEqual(rows[reservoir]['delta_level_m'], '')
             self.assertEqual(rows[reservoir]['abs_delta_level_m'], '')
             self.assertEqual(rows[reservoir]['delta_release_m3s'], '')
+            self.assertEqual(rows[reservoir]['within_ramp_limit'], '')
             for day in range(1, len(levels)):
                 row = rows[day*5+reservoir]
                 self.assertAlmostEqual(float(row['delta_level_m']),
                     levels[day, reservoir]-levels[day-1, reservoir], places=12)
                 self.assertAlmostEqual(float(row['delta_release_m3s']),
                     releases[day, reservoir]-releases[day-1, reservoir], places=12)
+                self.assertEqual(float(row['rise_limit_m_per_day']), 100.)
+                self.assertEqual(float(row['fall_limit_m_per_day']),
+                                 10. if reservoir == 0 else 100.)
+                self.assertEqual(row['within_ramp_limit'],
+                    '0' if day == 5 and reservoir == 0 else '1')
+        self.assertEqual(rows[5*5]['within_ramp_limit'], '0')
         join = rows[5*5]
         self.assertEqual(join['date'], '2001-01-01')
         self.assertEqual(join['year'], '2001')
@@ -107,6 +120,8 @@ class DailyChangeDataTest(unittest.TestCase):
         payload['dates'] = payload['dates'][:-1]
         payload['levels_end'] = payload['levels_end'][:-1]
         payload['release'] = payload['release'][:-1]
+        payload['ramp_rise_limit_m_per_day'] = payload['ramp_rise_limit_m_per_day'][:-1]
+        payload['ramp_fall_limit_m_per_day'] = payload['ramp_fall_limit_m_per_day'][:-1]
         payload['steps'] -= 1
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'changes.csv'
@@ -130,10 +145,11 @@ class DailyChangeOutputTest(unittest.TestCase):
                 [1, 2, 3], 'happo')
             self.assertEqual(set(paths), {1, 2, 3})
             for seed, files in paths.items():
-                self.assertEqual(len(files), 6)
+                self.assertEqual(len(files), 7)
                 self.assertTrue(all(path.parent == Path(directory)/'run' for path in files.values()))
                 self.assertIn('happo_seed{}'.format(seed), files['csv'].name)
-                self.assertEqual([name for name in files if name != 'csv' and name != 'statistics_csv'],
+                self.assertEqual([name for name in files if name not in
+                                  ('csv', 'statistics_csv', 'ramp_conflicts_csv')],
                     ['daily_level_change', 'level_change_heatmap',
                      'level_change_statistics', 'daily_release_change'])
 
@@ -177,12 +193,18 @@ class DailyChangeFigureTest(unittest.TestCase):
                     self.assertTrue(path.is_file())
                     self.assertGreater(path.stat().st_size, 1000)
                 series = plotting.load_daily_change_csv(csv_path)
+                self.assertTrue(series['has_ramp_limits'])
                 figures = [plotting.make_daily_level_change_figure(series),
                            plotting.make_level_change_heatmap_figure(series),
                            plotting.make_level_change_statistics_figure(series),
                            plotting.make_daily_release_change_figure(series)]
                 for figure in figures[:1]+figures[3:]:
                     self.assertEqual(len(figure.axes), 5)
+                self.assertTrue(all(any(line.get_label() == 'rise limit'
+                                         for line in ax.lines) for ax in figures[0].axes))
+                self.assertTrue(any(line.get_label() == 'outside hard ramp limit'
+                                    for line in figures[0].axes[0].collections
+                                    if hasattr(line, 'get_label')))
                 self.assertEqual(sum(any(ax.images for ax in figure.axes)
                                      for figure in figures[1:2]), 1)
                 self.assertEqual(sum(bool(ax.images) for ax in figures[1].axes), 5)
@@ -220,6 +242,12 @@ class AutomaticDailyChangeWorkflowTest(unittest.TestCase):
             self.assertEqual(len(rows), 3*5)
             self.assertTrue(all(rows[index]['delta_level_m'] == '' for index in range(5)))
             self.assertFalse(any(rows[index]['delta_level_m'] == '' for index in range(5, len(rows))))
+            conflict_rows = read_rows(run_dir/'happo_seed1_ramp_conflicts.csv')
+            self.assertEqual(conflict_rows, [])
+            with (run_dir/'happo_seed1_ramp_conflicts.csv').open(
+                    encoding='utf-8', newline='') as stream:
+                self.assertEqual(tuple(csv.DictReader(stream).fieldnames),
+                                 CONFLICT_FIELDS)
             completed = [json.loads(line) for line in (run_dir/'summary.jsonl').read_text().splitlines()]
             run_complete = [row for row in completed if row.get('record_type') == 'run_complete'][0]
             self.assertTrue(run_complete['daily_change_diagnostics']['enabled'])

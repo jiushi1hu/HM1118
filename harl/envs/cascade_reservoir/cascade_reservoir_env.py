@@ -8,6 +8,8 @@ from harl.envs.cascade_reservoir.reservoir_physics import (
 from harl.envs.cascade_reservoir.reward import OperationReward, reward_settings
 from harl.envs.cascade_reservoir.episodes import (
     DEFAULT_EPISODE_DAYS, DEFAULT_ACTION_BINS, positive_integer)
+from harl.envs.cascade_reservoir.level_ramp import (
+    RAMP_LEVEL_TOLERANCE_M, daily_level_ramp_limits)
 
 ACTOR_OBSERVATION_LAYOUT = 'cascade_local_upstream_downstream_system_v7'
 CRITIC_STATE_LAYOUT = 'concatenated_five_actor_observations_v1'
@@ -193,6 +195,7 @@ class CascadeReservoirEnv:
         if not isinstance(self.use_daily_level_limits, bool):
             raise ValueError('use_daily_level_limits must be a boolean')
         self.level_limits = data.load_daily_level_limits() if self.use_daily_level_limits else None
+        self.level_ramp_limits = daily_level_ramp_limits(config)
         self.reward_settings = reward_settings(config)
         self.operation_reward = OperationReward(data, self.reward_settings,
                                                timestep_seconds=self.physics.dt)
@@ -247,6 +250,75 @@ class CascadeReservoirEnv:
         if ((storage < lower-tolerance) | (storage > upper+tolerance)).any():
             raise InfeasibleCascade('Starting storage violates the preceding action\'s bounds')
 
+    def _transition_failure(self, exc, day, actions, ramp_info):
+        """Preserve structured infeasibility evidence across the environment API."""
+        message = '{}; date={} storage_m3={} actions={}'.format(
+            exc, day, self.storage.tolist(), actions.reshape(5).tolist())
+        if not isinstance(exc, InfeasibleCascade):
+            return type(exc)(message)
+        conflicts = [dict(value) for value in getattr(exc, 'conflicts', [])]
+        if ramp_info and not conflicts:
+            conflicts = [dict(reservoir='CASCADE', reservoir_index=-1,
+                              reason='physical_transition_infeasible')]
+        for conflict in conflicts:
+            conflict.setdefault('date', day.isoformat())
+            index = conflict.get('reservoir_index')
+            if not isinstance(index, int) or not 0 <= index < 5:
+                continue
+            conflict.setdefault('current_storage_m3', float(self.storage[index]))
+            if ramp_info:
+                conflict.setdefault('current_level_m',
+                    float(ramp_info['current_level_m'][index]))
+                conflict.setdefault('rise_limit_m_per_day',
+                    float(ramp_info['ramp_rise_limit_m_per_day'][index]))
+                conflict.setdefault('fall_limit_m_per_day',
+                    float(ramp_info['ramp_fall_limit_m_per_day'][index]))
+                conflict.setdefault('ramp_season',
+                    str(ramp_info['ramp_season'][index]))
+        error = InfeasibleCascade(message, conflicts=conflicts)
+        if hasattr(exc, 'ramp_metadata'):
+            error.ramp_metadata = exc.ramp_metadata
+        error.transition_context = dict(date=day.isoformat(),
+            storage_m3=self.storage.tolist(),
+            actions=actions.reshape(5).astype(int).tolist())
+        return error
+
+    def _check_executed_ramp(self, result):
+        """Reject a post-execution ramp violation without clipping state."""
+        if not result.get('level_ramp_enabled', False):
+            return
+        delta = result['levels_end']-result['levels_start']
+        within = ((delta <= result['ramp_rise_limit_m_per_day']+
+                   RAMP_LEVEL_TOLERANCE_M) &
+                  (delta >= -result['ramp_fall_limit_m_per_day']-
+                   RAMP_LEVEL_TOLERANCE_M))
+        result['level_change_m'] = delta
+        result['level_ramp_within_limits'] = within
+        if within.all():
+            return
+        conflicts = []
+        for index in np.flatnonzero(~within):
+            conflicts.append(dict(date=result['date'], reservoir=IDS[index],
+                reservoir_index=int(index), reason='executed_daily_level_ramp_violation',
+                current_level_m=float(result['levels_start'][index]),
+                rise_limit_m_per_day=float(result['ramp_rise_limit_m_per_day'][index]),
+                fall_limit_m_per_day=float(result['ramp_fall_limit_m_per_day'][index]),
+                ramp_season=str(result['ramp_season'][index]),
+                ramp_level_lower_m=float(result['ramp_level_lower_m'][index]),
+                ramp_level_upper_m=float(result['ramp_level_upper_m'][index]),
+                existing_level_lower_m=float(result['daily_level_lower_m'][index]),
+                existing_level_upper_m=float(result['daily_level_upper_m'][index]),
+                effective_level_lower_m=float(result['effective_level_lower_m'][index]),
+                effective_level_upper_m=float(result['effective_level_upper_m'][index]),
+                current_storage_m3=float(result['storage_start'][index]),
+                existing_storage_lower_m3=float(result['daily_storage_lower_m3'][index]),
+                existing_storage_upper_m3=float(result['daily_storage_upper_m3'][index]),
+                effective_storage_lower_m3=float(result['storage_lower_m3'][index]),
+                effective_storage_upper_m3=float(result['storage_upper_m3'][index])))
+        raise InfeasibleCascade(
+            'Executed transition violates the hard daily water-level ramp limit',
+            conflicts=conflicts)
+
     def reset(self):
         storage = self.initial_storage.copy()
         self._check_current_storage(storage, self.start)
@@ -294,27 +366,37 @@ class CascadeReservoirEnv:
             raise RuntimeError('Episode finished; reset explicitly')
         actions = np.asarray(actions)
         normalized = self.normalize_actions(actions)
+        ramp_info = {}
         try:
             self._check_current_storage(self.storage,self.index)
             lower, upper = self._next_state_storage_bounds(self.index)
+            next_level_lower, next_level_upper = self._next_state_level_bounds(self.index)
+            if self.level_ramp_limits.enabled:
+                lower, upper, ramp_info = self.level_ramp_limits.effective_storage_bounds(
+                    self.data, self.storage, self.data.dates[self.index], lower, upper,
+                    next_level_lower, next_level_upper)
             bounds = dict(storage_lower=lower, storage_upper=upper)
             result = self.physics.transition(self.storage,self.data.external[self.index],normalized,**bounds)
         except RuntimeError as exc:
-            raise type(exc)('{}; date={} storage_m3={} actions={}'.format(
-                exc,self.data.dates[self.index],self.storage.tolist(),actions.reshape(5).tolist())) from exc
+            raise self._transition_failure(exc, self.data.dates[self.index],
+                                          actions, ramp_info) from exc
         result['date'] = self.data.dates[self.index].isoformat()
         result['sampled_actions'] = actions.reshape(5).astype(np.int64).copy()
         result['requested_normalized_actions'] = normalized.copy()
         result['action_bins'] = self.action_bins
         result['timestep_seconds'] = self.physics.dt
         result['daily_level_limits'] = self.use_daily_level_limits
+        result.update(ramp_info if ramp_info else dict(level_ramp_enabled=False))
         result['normalized_actions'] = result['actions'].copy()
         result['actions'] = np.where(result['controls'] > 0,actions.reshape(5),0).astype(np.int64)
         result['levels_start'] = self.physics._forebay_levels(result['storage_start'])
         result['levels_end'] = self.data.levels(result['storage_end'])
-        next_level_lower, next_level_upper = self._next_state_level_bounds(self.index)
+        if ramp_info:
+            next_level_lower = ramp_info['effective_level_lower_m']
+            next_level_upper = ramp_info['effective_level_upper_m']
         result.update(next_state_level_lower_m=next_level_lower.copy(),
                       next_state_level_upper_m=next_level_upper.copy())
+        self._check_executed_ramp(result)
         self.operation_reward.apply(result)
         infos = [dict(bad_transition=False,use_daily_level_limits=self.use_daily_level_limits) for _ in range(5)]
         if self.level_limits is not None:
@@ -322,6 +404,13 @@ class CascadeReservoirEnv:
                 info.update(storage_lower_m3=float(lower[j]), storage_upper_m3=float(upper[j]),
                             next_state_level_lower_m=float(result['next_state_level_lower_m'][j]),
                             next_state_level_upper_m=float(result['next_state_level_upper_m'][j]))
+        if ramp_info:
+            for j,info in enumerate(infos):
+                info.update(level_ramp_enabled=True,
+                    rise_limit_m_per_day=float(result['ramp_rise_limit_m_per_day'][j]),
+                    fall_limit_m_per_day=float(result['ramp_fall_limit_m_per_day'][j]),
+                    level_change_m=float(result['level_change_m'][j]),
+                    level_ramp_within_limits=bool(result['level_ramp_within_limits'][j]))
         self.last_transition = result
         self.storage = result['storage_end'].copy()
         self.previous_release = result['release'].copy()

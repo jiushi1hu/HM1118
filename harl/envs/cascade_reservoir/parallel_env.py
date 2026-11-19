@@ -56,11 +56,13 @@ def _worker(connection):
                 if env is not None and metrics is not None:
                     try:
                         failure = episode_record(env, metrics, energy, seed, episode, gamma, trace, 1,
-                            dict(error_type=type(exc).__name__, reason=str(exc)))
+                            dict(error_type=type(exc).__name__, reason=str(exc),
+                                 conflicts=list(getattr(exc, 'conflicts', []))))
                     except Exception:
                         pass  # Preserve the original worker error if accounting also fails.
                 connection.send((False, dict(error=repr(exc), traceback=traceback.format_exc(),
-                                             episode_record=failure)))
+                                             episode_record=failure,
+                                             conflicts=list(getattr(exc, 'conflicts', [])))))
     except (EOFError, BrokenPipeError):
         pass
     finally:
@@ -121,6 +123,8 @@ class ParallelCascadeEnvs:
             error = RuntimeError('Parallel cascade environment failed: '+failures[0]['error']+
                                  '\n'+failures[0]['traceback'])
             error.episode_records = [r['episode_record'] for r in failures if r['episode_record'] is not None]
+            error.conflicts = [dict(value) for failure in failures
+                               for value in failure.get('conflicts', [])]
             # Other lanes can finish this day's transition before a peer fails.
             # Let the parent persist those completed steps before stopping.
             error.successful_step_results = [(lane, value) for lane, (ok, value) in enumerate(replies) if ok]

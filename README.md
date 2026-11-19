@@ -55,6 +55,16 @@ storage and level for each action date. Its row for date t constrains the state
 after action t; no extra date shift is applied. Previous executed bounds constrain
 the current state, including across source-year joins.
 
+Hard daily water-level ramps are configured under `daily_level_ramp_limits` in
+`cascade_reservoir.yaml`. WDD/BHT/XLD/XJB use constant absolute limits of
+1/2/3/4 m per day. THR uses 0.6 m/day in the dry months and 2.0 m/day in June--
+September; its August--October refill rise limit is 3.0 m/day while downward
+movement keeps the dry/flood seasonal limit. The current level plus/minus the
+applicable rise/fall band is intersected with daily and operating level/storage
+bounds before release dispatch. A disjoint intersection aborts the transition
+with structured conflict evidence. Executed levels are checked again after mass
+balance; storage and water levels are never clipped after execution.
+
 Every decision, including the last day, uses the same physical release mapping.
 There is no prescribed final water level, reserve-window override, terminal
 projection, seasonal refill budget or terminal-deviation reward. Storage is
@@ -92,8 +102,8 @@ u = k / (K - 1)
 release = feasible_low + u² * (feasible_high - feasible_low)
 ```
 
-Feasible release intervals enforce storage bounds, outlet capacities
-and downstream compatibility. Physically forced intervals
+Feasible release intervals enforce storage bounds, daily level-ramp limits,
+outlet capacities and downstream compatibility. Physically forced intervals
 mask actor learning and contribute a unit HAPPO correction factor. The default
 100-command grid can be changed with `--action-bins`.
 
@@ -212,7 +222,8 @@ older logs without that input retain their original dimensions.
 Every run with a final held-out evaluation and either `--plot-output` or
 `--episode-log` saves daily level and release diagnostics beside that output.
 With the timestamped `--plot-output "$run_dir/curves"` pattern, files go directly
-in `$run_dir`. Each seed gets one raw CSV, one level-statistics CSV, and four PNGs:
+in `$run_dir`. Each seed gets one raw CSV, one level-statistics CSV, one ramp
+conflict CSV, and four PNGs:
 `daily_level_change.png`, `abs_level_change_heatmap.png`,
 `level_change_statistics.png`, and `daily_release_change.png` (prefixed by the
 algorithm and seed). The first daily difference is an empty CSV cell; all later
@@ -220,10 +231,14 @@ differences are current minus previous in episode order. Nonconsecutive held-out
 year joins are retained on the actual-date axis, while the level difference across
 each join remains part of the continuous evaluation sequence.
 
-The figures show five reservoir panels per seed. The heatmap uses actual calendar
-year and day-of-year, including leap days. The statistics panels and summary CSV
-report mean, linearly interpolated P95, and maximum `|ΔZ|`. These diagnostics read
-executed end-of-day levels and daily releases only; they do not alter observations,
+The figures show five reservoir panels per seed and the applicable daily rise/fall
+envelope. Points outside the hard ramp limit are marked in red (blue crosses in
+the heatmap); the conflict CSV records infeasible dates, reservoirs, limits,
+bounds and reasons even when it contains only a header. The heatmap uses actual
+calendar year and day-of-year, including leap days. The statistics panels and
+summary CSV report mean, linearly interpolated P95, maximum `|ΔZ|`, the largest
+applicable limit, and ramp-violation counts. These diagnostics read executed
+end-of-day levels and daily releases only; they do not alter observations,
 rewards, actions, constraints, or optimization.
 
 ## Correctness figures
@@ -331,6 +346,7 @@ comparisons, not an executable multi-day intervention or evidence of optimality.
 | `harl/algorithms/`, `harl/models/`, `harl/common/` | PPO, critics, networks, buffers and ValueNorm |
 | `harl/envs/cascade_reservoir/data_loader.py` | Historical data, forecasts and ecological inputs |
 | `harl/envs/cascade_reservoir/reservoir_physics.py` | Water balance, generation and hard feasibility |
+| `harl/envs/cascade_reservoir/level_ramp.py` | Hard daily level-ramp bounds and conflict CSV evidence |
 | `harl/envs/cascade_reservoir/reward.py` | Ecological rewards and episode accounting |
 | `harl/envs/cascade_reservoir/evaluation.py`, `periodic_evaluation.py` | Evaluation and violation counts |
 | `harl/envs/cascade_reservoir/checkpoint.py` | Provenance-checked inference replay |
