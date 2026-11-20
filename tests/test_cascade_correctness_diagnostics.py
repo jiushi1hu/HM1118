@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from harl.envs.cascade_reservoir.correctness_diagnostics import CorrectnessRecorder
+from harl.envs.cascade_reservoir.correctness_diagnostics import (
+    CorrectnessRecorder, critic_quality_summary)
 from harl.envs.cascade_reservoir.data_loader import CascadeData, IDS
 from harl.envs.cascade_reservoir.episodes import episode_environment
 
@@ -78,6 +79,28 @@ class CascadeCorrectnessDiagnosticsTest(unittest.TestCase):
         self.assertEqual(result['storage']['storage_change_m3'], [0.]*5)
         self.assertEqual(result['storage']['net_storage_change_m3'], 0.)
         json.dumps(result, allow_nan=False)
+
+    def test_critic_quality_deduplicates_team_channel_and_normalizes_mixed_channels(self):
+        def report(mixed):
+            actors = [dict(agent=i, value_channel=i if mixed else 0,
+                learning_reward_source='mixed_rewards[{}]'.format(i) if mixed else 'system_reward',
+                mc_target=dict(std=2.+i), critic_mc_pre=dict(rmse=1., bias=.2, explained_variance=.1),
+                critic_mc_post=dict(rmse=.4, bias=-.1, explained_variance=.8),
+                gae_mc_sign_disagreement_fraction=.25-.02*i, nonzero_comparison_count=10)
+                for i in range(5)]
+            return dict(learning_signal=dict(critic_output_layout=
+                'mixed_by_reservoir' if mixed else 'shared_team',
+                critic_fitted_reward_basis='mixed_reward' if mixed else 'system_reward', actors=actors))
+        team = critic_quality_summary(report(False))
+        self.assertTrue(team['available'])
+        self.assertEqual(len(team['channels']), 1)
+        self.assertEqual(team['channels'][0]['agent_ids'], list(range(5)))
+        self.assertAlmostEqual(team['channels'][0]['critic_mc_post']['normalized_rmse'], .2)
+        mixed = critic_quality_summary(report(True))
+        self.assertEqual([row['value_channel'] for row in mixed['channels']], list(range(5)))
+        self.assertEqual([row['agent_ids'] for row in mixed['channels']], [[i] for i in range(5)])
+        self.assertAlmostEqual(mixed['channels'][4]['critic_mc_post']['normalized_bias'], -.1/6.)
+        json.dumps(mixed, allow_nan=False)
 
     def test_corrupted_storage_inflow_and_reward_are_exposed_without_repair(self):
         data, physical, original = golden_transition()

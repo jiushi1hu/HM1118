@@ -85,7 +85,7 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     parser.add_argument('--plot-output',type=Path,
                         help='Figure output stem: save training/evaluator/violation figures plus automatic daily-change diagnostics in the parent run directory')
     parser.add_argument('--correctness-output',type=Path,
-                        help='New directory for evidence.json and seven correctness figures; enables observational diagnostics and works with --no-plot')
+                        help='New directory for evidence.json and eight correctness figures; enables observational diagnostics and works with --no-plot')
     parser.add_argument('--no-plot',action='store_true',
                         help='Skip legacy figures and plot windows; automatic daily-change figures are still saved with --episode-log')
     if parser_extension is not None:

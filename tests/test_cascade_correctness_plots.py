@@ -27,7 +27,7 @@ from examples import plot_cascade_correctness as plots
 
 FIGURES = ('mass_balance', 'water_levels', 'release_feasibility',
            'storage_change', 'reward_reconciliation', 'happo_updates',
-           'operation_trajectories')
+           'operation_trajectories', 'training_reliability')
 IDS = ['WDD', 'BHT', 'XLD', 'XJB', 'THR']
 
 
@@ -130,6 +130,23 @@ def fixture(steps=2, failed=False):
                          surrogate=copy.deepcopy(surrogate)) for agent in range(5)]
         updates.append(dict(update=number, agent_order=order, actors=actors,
                             learning_metrics=learning, factor_oracle='independent float64 log ratio'))
+    quality_channels = [dict(value_channel=channel, agent_ids=[channel],
+        learning_reward_sources=['mixed_rewards['+str(channel)+']'],
+        learning_reward_source='mixed_rewards['+str(channel)+']', target_std=2.+channel,
+        critic_mc_pre=dict(rmse=2.-.2*number, bias=.4-.1*number, explained_variance=.1*number,
+            normalized_rmse=(2.-.2*number)/(2.+channel), normalized_bias=(.4-.1*number)/(2.+channel)),
+        critic_mc_post=dict(rmse=1.2-.1*number, bias=.2-.05*number, explained_variance=.55+.1*number,
+            normalized_rmse=(1.2-.1*number)/(2.+channel), normalized_bias=(.2-.05*number)/(2.+channel)),
+        gae_mc_sign_disagreement_fraction=.2-.05*number, nonzero_comparison_count=3)
+        for channel in range(5)]
+    for record in updates:
+        record['critic_quality'] = dict(available=True, critic_reward_layout='mixed_by_reservoir',
+            fitted_reward_basis='mixed_reward', channels=copy.deepcopy(quality_channels))
+    evaluation_records = [dict(evaluation_round=round_number,
+        training_steps=round_number*4, status='ok', evaluator_return=70.+2.*round_number,
+        return_basis='mean over fixed scenarios', ecological_flow_violation_rate=.15-.015*round_number,
+        completed_window_count=3, successful_window_count=3, window_count=3, physical_feasible=True)
+        for round_number in range(6)]
     return dict(schema='cascade_correctness_v2',
         configuration=dict(episode_horizon_days=2, parallel_environments=2,
             episodes_per_seed=4, updates_per_seed=2,
@@ -143,7 +160,10 @@ def fixture(steps=2, failed=False):
         interpretation='Independent consistency checks; not proof of hydraulic calibration or optimality.',
         trajectory_scope='deterministic final-policy median training-only evaluation scenario per seed',
         update_scope='all training updates; bounded summaries',
-        runs=[dict(seed=1, trajectory=trajectory, storage_records=[storage_record], update_records=updates)])
+        runs=[dict(seed=1, trajectory=trajectory, storage_records=[storage_record], update_records=updates,
+            critic_quality=dict(available=True, critic_reward_layout='mixed_by_reservoir',
+                fitted_reward_basis='mixed_reward', channels=copy.deepcopy(quality_channels)),
+            evaluation_records=evaluation_records)])
 
 
 def visible_text(figure):
@@ -208,7 +228,7 @@ class CorrectnessFigureTest(unittest.TestCase):
         self.assertNotIn('tolerance',text)
         self.assertNotIn('target',text)
 
-    def test_seven_figures_use_actual_physical_and_update_evidence_without_mutation(self):
+    def test_eight_figures_use_actual_physical_update_and_reliability_evidence_without_mutation(self):
         payload = fixture()
         original = copy.deepcopy(payload)
         figures = plots.make_figures(payload)
@@ -223,6 +243,8 @@ class CorrectnessFigureTest(unittest.TestCase):
         self.assertIn('reward', visible_text(figures['reward_reconciliation']))
         self.assertIn('factor', visible_text(figures['happo_updates']))
         self.assertIn('operation', visible_text(figures['operation_trajectories']))
+        self.assertIn('critic', visible_text(figures['training_reliability']))
+        self.assertIn('convergence', visible_text(figures['training_reliability']))
         levels = [np.asarray(line.get_ydata(), dtype=float) for ax in figures['water_levels'].axes
                   for line in ax.lines if np.ndim(line.get_ydata()) == 1]
         self.assertTrue(any(np.allclose(values, [5., 5.]) for values in levels if values.size == 2))
@@ -247,6 +269,20 @@ class CorrectnessFigureTest(unittest.TestCase):
                 if not steps:
                     self.assertIn('unavailable',visible_text(figures['storage_change']))
                 plt.close('all')
+
+    def test_legacy_evidence_without_reliability_fields_renders_unavailable(self):
+        payload = fixture()
+        run = payload['runs'][0]
+        run.pop('critic_quality')
+        run.pop('evaluation_records')
+        for record in run['update_records']:
+            record.pop('critic_quality')
+        figures = plots.make_figures(payload)
+        self.assertEqual(set(figures), set(FIGURES))
+        figures['training_reliability'].canvas.draw()
+        text = visible_text(figures['training_reliability'])
+        self.assertIn('unavailable', text)
+        self.assertIn('critic', text)
 
     def test_malformed_shape_nonfinite_and_unknown_schema_fail_before_drawing(self):
         cases = []
@@ -273,7 +309,7 @@ class CorrectnessPlotCLITest(unittest.TestCase):
         return subprocess.run([sys.executable, '-B', str(ROOT/'examples/plot_cascade_correctness.py'),
                                *map(str, arguments)], capture_output=True, text=True, env=environment)
 
-    def test_cli_saves_seven_exclusive_pngs_and_preserves_source_evidence_and_code(self):
+    def test_cli_saves_eight_exclusive_pngs_and_preserves_source_evidence_and_code(self):
         sources = [ROOT/'harl/runners/on_policy_ha_runner.py',
                    ROOT/'harl/envs/cascade_reservoir/reservoir_physics.py',
                    ROOT/'examples/plot_cascade_correctness.py']

@@ -68,12 +68,15 @@ class CorrectnessWorkflowTest(unittest.TestCase):
         self.assertLess(evidence['summary']['max_abs_reward_difference'], 1e-10)
         self.assertEqual(len(observed.correctness_update_history), 1)
         self.assertEqual(len(observed.correctness_update_history[0]['learning_metrics']), 5)
+        self.assertTrue(observed.correctness_update_history[0]['critic_quality']['available'])
+        self.assertEqual([channel['value_channel'] for channel in
+                          observed.correctness_update_history[0]['critic_quality']['channels']], [0])
         # The selected trajectory is the final deterministic policy, rather than
         # a stochastic trajectory collected before its final optimizer update.
         window = observed.periodic_evaluation_history[-1]['windows'][1]
         np.testing.assert_allclose(np.sum(evidence['series']['energy']), window['generation_MWh'])
 
-    def test_experiment_saves_reusable_evidence_and_dispatches_seven_figures(self):
+    def test_experiment_saves_reusable_evidence_and_dispatches_eight_figures(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             output = Path(directory)/'correctness'
             args = SimpleNamespace(episode_log=None, no_plot=True, skip_final_evaluation=False,
@@ -88,11 +91,13 @@ class CorrectnessWorkflowTest(unittest.TestCase):
             self.assertEqual(payload['configuration']['correctness_diagnostics']['figures'],
                 ['mass_balance.png', 'water_levels.png', 'release_feasibility.png',
                  'storage_change.png', 'reward_reconciliation.png', 'happo_updates.png',
-                 'operation_trajectories.png'])
+                 'operation_trajectories.png', 'training_reliability.png'])
             run = payload['runs'][0]
             self.assertEqual(run['seed'], 1)
             self.assertEqual(run['trajectory']['steps'], 3)
             self.assertIn('operation_trajectory', run)
+            self.assertTrue(run['update_records'][0]['critic_quality']['available'])
+            self.assertTrue(run['evaluation_records'])
             self.assertEqual(len(run['storage_records']), 2+2*3+1)
             self.assertEqual(run['storage_summary']['training']['record_count'], 2)
             self.assertEqual(run['storage_summary']['training_evaluation']['record_count'], 6)

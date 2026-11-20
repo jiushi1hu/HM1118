@@ -30,7 +30,7 @@ from harl.envs.cascade_reservoir.cascade_reservoir_env import (
 ROOT=Path(__file__).resolve().parents[1]
 CORRECTNESS_FIGURES = ('mass_balance', 'water_levels', 'release_feasibility',
                        'storage_change', 'reward_reconciliation', 'happo_updates',
-                       'operation_trajectories')
+                       'operation_trajectories', 'training_reliability')
 
 
 def validate_correctness_output(directory, other_paths=()):
@@ -50,6 +50,17 @@ def build_correctness_payload(runners, metadata, evaluations, evaluation_failure
     """Retain physical evidence, neutral endpoint inventories and HAPPO checks."""
     runs = []
     for runner in runners:
+        evaluation_records = [dict(
+            evaluation_round=int(record['evaluation_round']),
+            training_steps=int(record['training_steps']), status=record.get('status'),
+            evaluator_return=record.get('evaluator_return'),
+            return_basis=record.get('evaluator_return_aggregation'),
+            ecological_flow_violation_rate=record.get('ecological_flow_violation_rate'),
+            completed_window_count=record.get('completed_window_count'),
+            successful_window_count=record.get('successful_window_count'),
+            window_count=record.get('window_count'),
+            physical_feasible=record.get('physical_feasible'))
+            for record in runner.periodic_evaluation_history]
         records = []
         def storage_record(row, phase, scenario_id, policy_update=None):
             completed = bool(row.get('completed', True)) and row.get('status') not in (
@@ -95,14 +106,16 @@ def build_correctness_payload(runners, metadata, evaluations, evaluation_failure
                 measured_count=sum(row['available'] for row in rows))
                 for phase in ('training', 'training_evaluation', 'evaluation')
                 for rows in [[row for row in records if row['phase'] == phase]]},
-            update_records=runner.correctness_update_history))
+            update_records=runner.correctness_update_history,
+            evaluation_records=evaluation_records))
     return dict(schema='cascade_correctness_v2', configuration=metadata, runs=runs,
         evaluation_failure=evaluation_failure,
         interpretation='Independent numerical consistency checks; endpoint storage changes are inventory accounting, not constraint violations',
         trajectory_scope='deterministic final-policy median training-only evaluation scenario per seed',
         operation_scope='deterministic final-policy operation over five complete calendar years from the selected median training-only window; leap days retained',
         storage_scope='all collected episodes, every periodic round and optional held-out sequence; compact initial/final inventories',
-        update_scope='all training updates; bounded summaries, no additional optimizer steps')
+        update_scope='all training updates; bounded summaries, no additional optimizer steps',
+        training_reliability_scope='Critic fit against realized collected returns by unique value channel; fixed-scenario evaluator histories for every seed')
 
 
 def save_correctness_outputs(runners, metadata, evaluations, directory, plot_python,
@@ -118,7 +131,7 @@ def save_correctness_outputs(runners, metadata, evaluations, directory, plot_pyt
         '--input',str(evidence_path),'--output-dir',str(directory),'--no-show'],check=True,
         stdout=None if metadata.get('config', {}).get('experiment', {}).get('verbose_console', False)
                     else subprocess.DEVNULL)
-    print('Correctness evidence and seven figures saved to '+str(directory.resolve()),flush=True)
+    print('Correctness evidence and eight figures saved to '+str(directory.resolve()),flush=True)
 
 
 def step_metrics_paths(episode_log, seeds):
@@ -221,7 +234,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     correctness_dir = getattr(args, 'correctness_output', None)
     correctness_enabled = correctness_dir is not None
     if correctness_enabled and getattr(runner_cls, 'algorithm_name', 'happo') != 'happo':
-        raise ValueError('The seven correctness figures require HAPPO; select --algorithms happo')
+        raise ValueError('The eight correctness figures require HAPPO; select --algorithms happo')
     days=positive_integer(config['train']['episode_length'],'episode_days')
     count=positive_integer(config['train']['n_rollout_threads'],'parallel_envs')
     episodes=positive_integer(config['experiment']['episodes'],'episodes')
@@ -442,7 +455,8 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             physical_scope='one final-policy deterministic median training window per seed',
             operation_scope='five complete calendar years from the selected median training-only window; deterministic final policy, leap days retained',
             update_scope='all HAPPO updates; independent float64 prefix-likelihood checks',
-            storage_scope='all collected episode inventories, all periodic rounds including round zero, and optional held-out sequence')
+            storage_scope='all collected episode inventories, all periodic rounds including round zero, and optional held-out sequence',
+            reliability_scope='read-only Critic fit and fixed-scenario convergence evidence; no extra training or evaluation')
     if credit_mode == 'counterfactual':
         learning_objective.update(advantage_source='counterfactual_shared_team',
             normalization='common_controllable_rms_without_centering')

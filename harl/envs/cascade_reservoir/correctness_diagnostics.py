@@ -32,6 +32,70 @@ _OPTIONAL_VECTORS = (
 )
 
 
+def critic_quality_summary(report):
+    """Summarize read-only Critic fit evidence by unique training value channel.
+
+    The learning-signal observer repeats the same fitted return for shared-team
+    actors. Deduplicating by ``value_channel`` makes those repeated views one
+    observation while retaining each reservoir's reward-to-channel mapping.
+    """
+    if not isinstance(report, dict) or not isinstance(report.get('learning_signal'), dict):
+        return dict(available=False, reason='Critic learning-signal evidence is unavailable', channels=[])
+    signal = report['learning_signal']
+    actors = signal.get('actors')
+    if not isinstance(actors, list) or not actors:
+        return dict(available=False, reason='No actor-to-value-channel mapping was retained', channels=[])
+    grouped = {}
+    for actor in actors:
+        if not isinstance(actor, dict) or not isinstance(actor.get('value_channel'), (int, np.integer)):
+            return dict(available=False, reason='Malformed Critic learning-signal evidence', channels=[])
+        channel = int(actor['value_channel'])
+        grouped.setdefault(channel, []).append(actor)
+
+    def normalized(metrics, target_std):
+        if not isinstance(metrics, dict):
+            return dict(rmse=None, bias=None, explained_variance=None,
+                        normalized_rmse=None, normalized_bias=None)
+        rmse, bias = metrics.get('rmse'), metrics.get('bias')
+        valid_scale = (isinstance(target_std, (int, float, np.floating)) and
+                       np.isfinite(target_std) and target_std > 0.)
+        return dict(rmse=rmse, bias=bias,
+            explained_variance=metrics.get('explained_variance'),
+            normalized_rmse=(float(rmse/target_std) if valid_scale and rmse is not None else None),
+            normalized_bias=(float(bias/target_std) if valid_scale and bias is not None else None))
+
+    channels = []
+    for channel in sorted(grouped):
+        rows = grouped[channel]
+        target_std = None
+        for row in rows:
+            target = row.get('mc_target')
+            if isinstance(target, dict) and isinstance(target.get('std'), (int, float, np.floating)):
+                target_std = float(target['std'])
+                break
+        disagreement = [(row.get('gae_mc_sign_disagreement_fraction'), row.get('nonzero_comparison_count', 0))
+                        for row in rows if row.get('gae_mc_sign_disagreement_fraction') is not None]
+        total = sum(count for _, count in disagreement)
+        source = rows[0].get('learning_reward_source')
+        channels.append(dict(
+            value_channel=channel,
+            agent_ids=sorted(int(row['agent']) for row in rows if isinstance(row.get('agent'), (int, np.integer))),
+            learning_reward_sources=sorted({str(row['learning_reward_source']) for row in rows
+                                            if row.get('learning_reward_source') is not None}),
+            learning_reward_source=source,
+            target_std=target_std,
+            critic_mc_pre=normalized(rows[0].get('critic_mc_pre'), target_std),
+            critic_mc_post=normalized(rows[0].get('critic_mc_post'), target_std),
+            gae_mc_sign_disagreement_fraction=(float(sum(value*count for value, count in disagreement)/total)
+                                               if total else None),
+            nonzero_comparison_count=int(total)))
+    return dict(available=True, critic_reward_layout=signal.get('critic_output_layout'),
+        fitted_reward_basis=signal.get('critic_fitted_reward_basis'),
+        target_definition='realized discounted Monte Carlo return of the collected actions',
+        normalization='fit metric divided by the same value-channel realized-return standard deviation',
+        channels=channels)
+
+
 def _vector(value, name):
     value = np.asarray(value, dtype=np.float64)
     if value.shape != (5,) or not np.isfinite(value).all():

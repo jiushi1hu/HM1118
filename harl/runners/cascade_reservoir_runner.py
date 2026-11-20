@@ -574,8 +574,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                                'weighted_entropy_','regularized_objective_'))}
                     self.diagnostics_history.append(report)
                     if self.correctness_enabled:
+                        from harl.envs.cascade_reservoir.correctness_diagnostics import critic_quality_summary
                         evidence = copy.deepcopy(self.last_correctness_happo)
                         evidence['learning_metrics'] = copy.deepcopy(report['actors'])
+                        evidence['critic_quality'] = critic_quality_summary(report)
                         self.correctness_update_history.append(evidence)
                         self._log_record(dict(evidence, record_type='correctness_happo_update', seed=self.seed))
                     self._log_record(dict(report,record_type='training_diagnostics',seed=self.seed))

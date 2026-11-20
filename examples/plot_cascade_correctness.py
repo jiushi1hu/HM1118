@@ -1,4 +1,4 @@
-"""Render seven observational correctness figures using NumPy and Matplotlib only."""
+"""Render eight observational correctness figures using NumPy and Matplotlib only."""
 import argparse
 import calendar
 from datetime import date
@@ -10,7 +10,7 @@ import numpy as np
 
 FIGURE_KEYS = ('mass_balance', 'water_levels', 'release_feasibility',
                'storage_change', 'reward_reconciliation', 'happo_updates',
-               'operation_trajectories')
+               'operation_trajectories', 'training_reliability')
 IDS = ('WDD', 'BHT', 'XLD', 'XJB', 'THR')
 VECTOR_FIELDS = ('storage_start', 'storage_end', 'levels_start', 'levels_end',
     'external', 'inflow', 'release', 'low', 'high', 'controls', 'power', 'energy',
@@ -118,6 +118,42 @@ def validate_payload(payload):
                         _array([stats[q] for q in QUANTILES], (4,), key)
                 for key in ('factor_max_abs_error', 'factor_max_relative_error'):
                     _array(actor[key], (), key)
+        critic_quality = run.get('critic_quality')
+        if critic_quality is not None:
+            if not isinstance(critic_quality, dict) or not isinstance(critic_quality.get('channels', []), list):
+                raise ValueError('critic_quality must be an evidence object with a channels list')
+            previous_channel = -1
+            for channel in critic_quality.get('channels', []):
+                number = channel.get('value_channel') if isinstance(channel, dict) else None
+                if (isinstance(number, bool) or not isinstance(number, int) or number < 0 or
+                        number <= previous_channel):
+                    raise ValueError('Critic value channels must be distinct nonnegative integers')
+                previous_channel = number
+                for name in ('critic_mc_pre', 'critic_mc_post'):
+                    metrics = channel.get(name)
+                    if metrics is not None:
+                        if not isinstance(metrics, dict):
+                            raise ValueError(name+' must be a metrics object')
+                        for key, value in metrics.items():
+                            if value is not None:
+                                _array(value, (), name+'.'+key)
+        previous_round = -1
+        for record in run.get('evaluation_records', []):
+            if not isinstance(record, dict):
+                raise ValueError('Every evaluation record must be an object')
+            number = record.get('evaluation_round')
+            if (isinstance(number, bool) or not isinstance(number, int) or
+                    number < 0 or number <= previous_round):
+                raise ValueError('Evaluation rounds must be strictly increasing nonnegative integers')
+            previous_round = number
+            for key in ('training_steps', 'completed_window_count', 'successful_window_count', 'window_count'):
+                value = record.get(key)
+                if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                    raise ValueError('evaluation_records.'+key+' must be a nonnegative integer or null')
+            for key in ('evaluator_return', 'ecological_flow_violation_rate'):
+                value = record.get(key)
+                if value is not None:
+                    _array(value, (), 'evaluation_records.'+key)
     return runs
 
 
@@ -339,8 +375,177 @@ def make_operation_figure(payload):
     return figure
 
 
+def _critic_channel_label(channel):
+    agents = [agent for agent in channel.get('agent_ids', []) if 0 <= agent < len(IDS)]
+    sources = channel.get('learning_reward_sources', [])
+    if any(str(source).startswith('mixed_rewards') for source in sources) and agents:
+        return 'Mixed reward ('+', '.join(IDS[agent] for agent in agents)+')'
+    if any(str(source) == 'system_reward' for source in sources):
+        return 'System reward (shared)'
+    if sources:
+        return str(sources[0])
+    return 'Value channel '+str(channel.get('value_channel', '?'))
+
+
+def make_training_reliability_figure(payload):
+    """Show Critic fit and fixed-scenario histories without changing training."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    runs = payload['runs']
+    with plt.rc_context({'font.size': 9}):
+        figure, axes = plt.subplots(2, 3, figsize=(15.5, 8.2), constrained_layout=True)
+        figure.suptitle('HAPPO training reliability: Critic fit and fixed-scenario convergence', fontsize=14)
+        critic_axes = axes[0]
+        for ax, ylabel in zip(critic_axes, (
+                'Explained variance', 'Normalized RMSE', 'Normalized bias')):
+            ax.grid(alpha=.22)
+            ax.set_xlabel('Completed policy update')
+            ax.set_ylabel(ylabel)
+        critic_axes[0].set_title('Critic fit to realized collected returns')
+        critic_axes[1].set_title('Critic error relative to return spread')
+        critic_axes[2].set_title('Signed Critic bias relative to return spread')
+        critic_axes[0].axhline(1., color='black', ls='--', lw=.7, label='Perfect prediction')
+        critic_axes[0].axhline(0., color='gray', ls=':', lw=.7, label='No explained variance')
+        critic_axes[1].axhline(0., color='black', ls='--', lw=.7, label='Zero error')
+        critic_axes[2].axhline(0., color='black', ls='--', lw=.7, label='Zero bias')
+        colors = plt.get_cmap('tab10')
+        critic_available = False
+
+        def column_summary(values):
+            values = np.asarray(values, dtype=float)
+            valid = np.isfinite(values)
+            count = valid.sum(axis=0)
+            mean = np.divide(np.nansum(values, axis=0), count,
+                             out=np.full(values.shape[1], np.nan), where=count > 0)
+            low = np.where(valid, values, np.inf).min(axis=0)
+            high = np.where(valid, values, -np.inf).max(axis=0)
+            low[count == 0], high[count == 0] = np.nan, np.nan
+            return mean, low, high
+
+        channel_numbers = sorted({channel.get('value_channel') for run in runs
+            for channel in run.get('critic_quality', {}).get('channels', [])})
+        for channel_number in channel_numbers:
+            metadata = next((channel for run in runs
+                for channel in run.get('critic_quality', {}).get('channels', [])
+                if channel.get('value_channel') == channel_number), None)
+            if metadata is None:
+                continue
+            histories = []
+            for run in runs:
+                history = {}
+                for record in run.get('update_records', []):
+                    item = record.get('critic_quality')
+                    if not isinstance(item, dict):
+                        continue
+                    match = next((value for value in item.get('channels', [])
+                                  if value.get('value_channel') == channel_number), None)
+                    if match is not None:
+                        history[record['update']] = match
+                if history:
+                    histories.append(history)
+            if not histories:
+                continue
+            critic_available = True
+            label = _critic_channel_label(metadata)
+            color = colors(channel_number % 10)
+            updates = sorted({update for history in histories for update in history})
+            x = np.asarray(updates)
+            for axis, key in ((critic_axes[0], 'explained_variance'),
+                              (critic_axes[1], 'normalized_rmse'),
+                              (critic_axes[2], 'normalized_bias')):
+                matrix = np.asarray([[history.get(update, {}).get('critic_mc_post', {}).get(key)
+                                     if history.get(update, {}).get('critic_mc_post') else np.nan
+                                     for update in updates] for history in histories], dtype=float)
+                mean, low, high = column_summary(matrix)
+                axis.plot(x, mean, color=color, lw=1., marker='o', ms=2.5,
+                          label=label if axis is critic_axes[0] else None)
+                if len(histories) > 1:
+                    axis.fill_between(x, low, high, color=color, alpha=.12, lw=0)
+                if key == 'explained_variance':
+                    pre_matrix = np.asarray([[history.get(update, {}).get('critic_mc_pre', {}).get(key)
+                                              if history.get(update, {}).get('critic_mc_pre') else np.nan
+                                              for update in updates] for history in histories], dtype=float)
+                    pre_mean, _, _ = column_summary(pre_matrix)
+                    axis.plot(x, pre_mean, color=color, lw=.7, ls=':', alpha=.7)
+        if not critic_available:
+            for ax in critic_axes:
+                ax.text(.5, .5, 'Unavailable: no Critic fit history', ha='center', va='center',
+                        transform=ax.transAxes)
+        critic_axes[0].text(.02, .02, 'Solid: post-update mean; band: seed range; dotted: pre-update',
+                            transform=critic_axes[0].transAxes, fontsize=7)
+        for ax in critic_axes:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, labels, fontsize=6, ncol=2, loc='best')
+
+        convergence = axes[1]
+        for ax, ylabel, title in zip(convergence, (
+                'Fixed-scenario return', 'Ecological-flow violation rate (%)', 'Return of final five rounds'),
+                ('Fixed-scenario evaluator return', 'Ecological-flow constraint frequency',
+                 'Cross-seed final return spread')):
+            ax.grid(alpha=.22)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+        convergence[0].set_xlabel('Evaluation round (policy update)')
+        convergence[1].set_xlabel('Evaluation round (policy update)')
+        convergence[2].set_xlabel('Seed and cross-seed aggregate')
+        evaluation_available = False
+        final_returns = []
+        for run_index, run in enumerate(runs):
+            records = [record for record in run.get('evaluation_records', [])
+                       if record.get('evaluator_return') is not None]
+            if not records:
+                continue
+            evaluation_available = True
+            color = colors(run_index % 10)
+            rounds = np.asarray([record['evaluation_round'] for record in records])
+            returns = np.asarray([record['evaluator_return'] for record in records], dtype=float)
+            convergence[0].plot(rounds, returns, color=color, lw=1., marker='o', ms=2.5,
+                                label='Seed '+str(run['seed']))
+            ecology = [(record['evaluation_round'], record['ecological_flow_violation_rate'])
+                       for record in records if record.get('ecological_flow_violation_rate') is not None]
+            if ecology:
+                convergence[1].plot([item[0] for item in ecology],
+                                    [100.*item[1] for item in ecology], color=color,
+                                    lw=1., marker='o', ms=2.5, label='Seed '+str(run['seed']))
+            final_returns.append((run['seed'], float(np.mean(returns[-5:])), color))
+        if not evaluation_available:
+            convergence[0].text(.5, .5, 'Unavailable: no evaluation history', ha='center', va='center',
+                                transform=convergence[0].transAxes)
+        if not any(row.get('ecological_flow_violation_rate') is not None
+                   for run in runs for row in run.get('evaluation_records', [])):
+            convergence[1].text(.5, .5, 'Unavailable: no ecological-flow history', ha='center',
+                                va='center', transform=convergence[1].transAxes)
+        convergence[1].yaxis.set_major_formatter(PercentFormatter(100.))
+        convergence[1].axhline(0., color='gray', ls=':', lw=.7)
+        for position, (seed, value, color) in enumerate(final_returns, 1):
+            convergence[2].scatter(position, value, s=35, color=color, label='Seed '+str(seed))
+            convergence[2].annotate('{:.2f}'.format(value), (position, value), xytext=(3, 4),
+                                    textcoords='offset points', fontsize=7)
+        if final_returns:
+            values = np.asarray([value for _, value, _ in final_returns])
+            mean, spread = float(values.mean()), float(values.std(ddof=0))
+            convergence[2].errorbar(0., mean, yerr=spread, fmt='s', color='black', capsize=4,
+                                    label='Cross-seed mean ± SD')
+            convergence[2].axhline(mean, color='black', ls='--', lw=.7)
+            convergence[2].set_xticks(range(len(final_returns)+1),
+                ['Mean']+['Seed '+str(seed) for seed, _, _ in final_returns])
+            if len(values) < 2:
+                convergence[2].text(.02, .98, 'SD requires at least two seeds',
+                                    transform=convergence[2].transAxes, va='top', fontsize=7)
+        else:
+            convergence[2].text(.5, .5, 'Unavailable: fewer than five evaluator rounds', ha='center',
+                                va='center', transform=convergence[2].transAxes)
+        for ax in convergence:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, labels, fontsize=7, loc='best')
+    return figure
+
+
 def make_figures(payload):
-    """Return seven figures from saved evidence without model imports or mutation."""
+    """Return eight figures from saved evidence without model imports or mutation."""
     try:
         runs = validate_payload(payload)
     except (KeyError, TypeError) as exc:
@@ -542,6 +747,7 @@ def make_figures(payload):
         axes[0, column].text(.02, .98, 'Filled: used; open: independent\nv=min, o=median, ^=p95, square=max\nColors: '+', '.join(IDS),
             transform=axes[0, column].transAxes, va='top', fontsize=6)
     figures['operation_trajectories'] = make_operation_figure(payload)
+    figures['training_reliability'] = make_training_reliability_figure(payload)
     return {key: figures[key] for key in FIGURE_KEYS}
 
 
@@ -549,7 +755,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check-backend', action='store_true', help='Check headless Matplotlib, then exit')
     parser.add_argument('--input', type=Path, help='Evidence JSON; omit to read JSON from standard input')
-    parser.add_argument('--output-dir', type=Path, help='Output directory; may contain input evidence, but seven PNG targets must be new')
+    parser.add_argument('--output-dir', type=Path, help='Output directory; may contain input evidence, but eight PNG targets must be new')
     parser.add_argument('--no-show', action='store_true', help='Use Agg and save figures without opening windows')
     args = parser.parse_args(argv)
     import matplotlib

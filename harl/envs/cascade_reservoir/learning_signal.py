@@ -157,6 +157,7 @@ def learning_signal_report(runner, before, post_prediction):
             pre_value=signal_statistics(old_prediction[..., own]),
             post_value=signal_statistics(post_prediction[..., own]),
             gae_target=signal_statistics(targets[..., own]),
+            mc_target=signal_statistics(mc[..., own]),
             critic_mc_pre=_fit(mc[..., own], old_prediction[..., own]),
             critic_mc_post=_fit(mc[..., own], post_prediction[..., own]),
             controllable_rows=int(active.sum()), objective_rows=int(objective.sum()),

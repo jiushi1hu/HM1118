@@ -243,9 +243,9 @@ rewards, actions, constraints, or optimization.
 
 ## Correctness figures
 
-`--correctness-output NEW_DIRECTORY` enables seven additional diagnostic figures
+`--correctness-output NEW_DIRECTORY` enables eight additional diagnostic figures
 and saves their numerical evidence to `NEW_DIRECTORY/evidence.json`. It works
-with `--no-plot`: these seven figures are saved using a headless Matplotlib backend,
+with `--no-plot`: these eight figures are saved using a headless Matplotlib backend,
 while the standard interactive figures remain disabled. Select an interpreter
 with NumPy and Matplotlib using `--plot-python` when training uses a different
 Python environment.
@@ -257,7 +257,8 @@ python -B examples/train_cascade.py --seeds 1 2 3 \
 
 The files are `mass_balance.png`, `water_levels.png`,
 `release_feasibility.png`, `storage_change.png`,
-`reward_reconciliation.png`, `happo_updates.png`, and `operation_trajectories.png`.
+`reward_reconciliation.png`, `happo_updates.png`, `operation_trajectories.png`,
+and `training_reliability.png`.
 
 Physical traces come from the final policy's deterministic median training-only
 evaluation window, reusing the existing evaluation rather than collecting extra
@@ -289,6 +290,14 @@ against a separate float64 sum of categorical log-likelihood changes, with force
 commands contributing a unit ratio. Factor errors, final likelihood ratios, KL,
 clipping and entropy are recorded as bounded summaries. These observers do not
 sample actions, advance optimizers or change training targets.
+
+`training_reliability.png` adds read-only Critic fit and convergence evidence.
+It reports realized-return explained variance, error and bias normalized by the
+corresponding return spread, one line per unique value channel. The same figure
+shows fixed-scenario evaluator returns and ecological-flow violation rates for
+every seed and the spread of each seed's final five-round mean. Shared-team GAE
+has one Critic channel; mixed GAE has five reservoir-aligned channels. Legacy
+evidence without these optional fields renders the panels as unavailable.
 
 The feature is HAPPO-only, including counterfactual-credit HAPPO. For the
 comparison entry point, select `--algorithms happo`. Existing output directories
