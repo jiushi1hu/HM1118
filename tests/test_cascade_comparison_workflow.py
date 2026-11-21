@@ -221,7 +221,7 @@ class ComparisonDispatchTest(unittest.TestCase):
     def test_second_algorithm_collision_is_rejected_before_first_training(self):
         config, physical = cli.load_configuration()
         config['experiment']['seeds'] = [1, 2, 3]
-        for kind in ('summary', 'steps', 'checkpoints'):
+        for kind in ('summary', 'steps', 'checkpoints', 'manifest'):
             with self.subTest(output=kind), tempfile.TemporaryDirectory() as directory:
                 directory = Path(directory)
                 base = directory/'paired.jsonl'
@@ -230,6 +230,8 @@ class ComparisonDispatchTest(unittest.TestCase):
                     collision = second
                 elif kind == 'steps':
                     collision = directory/'paired_mappo_seed2_steps.csv'
+                elif kind == 'manifest':
+                    collision = directory/'paired_mappo_manifest.json'
                 else:
                     collision = directory/'paired_mappo_seed2_checkpoints'
                 if kind == 'checkpoints':

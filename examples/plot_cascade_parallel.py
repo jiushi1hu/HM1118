@@ -1,14 +1,30 @@
 """Unsmoothed seed means and standard deviations for collection and evaluation."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
 import sys
 import numpy as np
 
+try:
+    from examples.train_cascade_parallel import verify_artifact_manifest
+except ImportError:  # A minimal NumPy/Matplotlib interpreter can still replot evidence.
+    verify_artifact_manifest = None
+
 
 VIOLATION_TERMS = ('ecological_flow',)
 VIOLATION_SUFFIXES = ('violation_rate', 'violation_count', 'active_reservoir_days')
+COMPLETION_PROVENANCE_FIELDS = ('artifact_manifest', 'artifact_inventory',
+    'continuation_provenance', 'completion_record', 'artifact_manifest_integrity')
+
+
+def provenance_core(provenance):
+    """Compare immutable run identity without its post-run artifact audit fields."""
+    if not isinstance(provenance, dict):
+        raise ValueError('Run provenance must be an object')
+    return {key:value for key, value in provenance.items()
+            if key not in COMPLETION_PROVENANCE_FIELDS}
 
 
 def learning_return_kind(payload):
@@ -220,6 +236,7 @@ def load_episode_log(path):
     """Stream summary records, retaining collector and evaluator histories separately."""
     configuration, histories, updates = None, {}, {}
     evaluations, last_rounds, scenarios = {}, {}, None
+    run_identity, completion_identity = None, None
     pending_episodes = {}
     pending_lanes = {}
     # Step writers put record_type first. Other key orders still use the JSON
@@ -246,9 +263,13 @@ def load_episode_log(path):
             if not isinstance(row, dict):
                 raise ValueError('Log records must be JSON objects at line {}'.format(line_number))
             kind = row.get('record_type')
-            if kind not in ('run_configuration', 'training_episode', 'training_update', 'periodic_evaluation'):
+            if kind not in ('run_configuration', 'training_episode', 'training_update',
+                            'periodic_evaluation', 'run_complete'):
                 continue
             try:
+                if kind == 'run_complete':
+                    completion_identity = (row.get('run_id'), row.get('provenance'))
+                    continue
                 if kind == 'run_configuration':
                     if configuration is not None:
                         raise ValueError('A plot input must contain exactly one run configuration')
@@ -263,6 +284,10 @@ def load_episode_log(path):
                     configuration = dict(gamma=gamma, configured_seeds=seeds,
                         episode_horizon_days=positive_integer(row['episode_horizon_days'], 'episode_horizon_days'),
                         parallel_envs=positive_integer(row['parallel_environments'], 'parallel_environments'))
+                    for name in ('run_id', 'provenance'):
+                        if name in row:
+                            configuration[name] = row[name]
+                    run_identity = (row.get('run_id'), row.get('provenance'))
                     if 'updates_per_seed' in row:
                         configuration['updates_per_seed'] = positive_integer(row['updates_per_seed'], 'updates_per_seed')
                     periodic = row.get('periodic_evaluation', {})
@@ -277,6 +302,11 @@ def load_episode_log(path):
                     continue
                 if configuration is None:
                     raise ValueError('A run_configuration must precede training/evaluation results')
+                recorded_run_id = row.get('run_id',
+                    row.get('learning_rewards', {}).get('run_id')
+                    if isinstance(row.get('learning_rewards'), dict) else None)
+                if recorded_run_id is not None and recorded_run_id != configuration.get('run_id'):
+                    raise ValueError('A result record belongs to a different run_id')
                 seed = row['seed']
                 if isinstance(seed, bool) or not isinstance(seed, int) or seed not in configuration['configured_seeds']:
                     raise ValueError('Result seed is absent from the run configuration')
@@ -356,6 +386,48 @@ def load_episode_log(path):
                 raise ValueError('Invalid plotting input at line {}: {}'.format(line_number, exc)) from exc
     if configuration is None:
         raise ValueError('No run_configuration found in the episode log')
+    if completion_identity is not None:
+        if completion_identity[0] != run_identity[0]:
+            raise ValueError('run_complete provenance disagrees with run_configuration')
+        if provenance_core(completion_identity[1]) != provenance_core(run_identity[1]):
+            raise ValueError('run_complete provenance disagrees with run_configuration')
+    log_path = Path(path)
+    manifest_candidates = [log_path.with_name(log_path.stem+'_manifest.json'),
+                           log_path.parent/'run_manifest.json']
+    if completion_identity is not None:
+        recorded_manifest = completion_identity[1].get('artifact_manifest')
+        if isinstance(recorded_manifest, str) and recorded_manifest:
+            manifest_candidates.append(Path(recorded_manifest))
+    manifest_path = next((candidate for candidate in manifest_candidates
+                          if candidate.is_file()), None)
+    if verify_artifact_manifest is not None and manifest_path is not None:
+        manifest = verify_artifact_manifest(manifest_path)
+        if configuration.get('run_id') != manifest.get('run_id'):
+            raise ValueError('Episode log and artifact manifest belong to different runs')
+        def binds_log(row):
+            artifact = Path(row['path'])
+            if not artifact.is_absolute():
+                artifact = manifest_path.parent/artifact
+            return artifact.resolve() == log_path.resolve()
+        log_artifact = next((row for row in manifest['artifacts'] if binds_log(row)), None)
+        if log_artifact is None:
+            raise ValueError('Artifact manifest does not bind the episode log')
+        if log_artifact['sha256'] != hashlib.sha256(log_path.read_bytes()).hexdigest():
+            # The manifest hashes the final closed log. A completed run cannot
+            # silently substitute another file with the same run_configuration.
+            raise ValueError('Episode log hash disagrees with its artifact manifest')
+    if run_identity[0] is not None:
+        run_provenance = run_identity[1]
+        if (not isinstance(run_provenance, dict) or
+                run_provenance.get('run_id') != run_identity[0]):
+            raise ValueError('Run identity requires matching provenance')
+        source_hashes = run_provenance.get('source_code_hashes', {})
+        if not isinstance(source_hashes, dict):
+            raise ValueError('Run provenance source code hashes must be an object')
+        source_hashes = {str(name).replace('\\', '/'):value
+                         for name, value in source_hashes.items()}
+        if source_hashes.get('examples/plot_cascade_parallel.py') is None:
+            raise ValueError('Run provenance lacks the plotting transport hash')
     seeds = [seed for seed in configuration['configured_seeds'] if histories.get(seed) or evaluations.get(seed)]
     if not seeds:
         raise ValueError('No training updates or periodic evaluations have been recorded yet')

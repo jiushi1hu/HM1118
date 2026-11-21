@@ -299,6 +299,23 @@ every seed and the spread of each seed's final five-round mean. Shared-team GAE
 has one Critic channel; mixed GAE has five reservoir-aligned channels. Legacy
 evidence without these optional fields renders the panels as unavailable.
 
+Correctness evidence uses schema `cascade_correctness_v3`. Critic fit histories
+are read from each entry in `update_records`; the run-level `critic_quality` is
+only an index of the latest update. The convergence panel follows the declared
+learning objective: `system_evaluator_return` for `team_gae`, or the mean of
+`mixed_evaluator_returns` for `mixed_gae`. It never substitutes the legacy
+`evaluator_return` when the selected field is missing.
+
+Each run with `--episode-log` or `--plot-output` writes an exclusive artifact
+manifest after its log and figures are complete. Records carry the same `run_id`
+as the run configuration, and the correctness renderer writes and verifies
+`manifest.json` beside `evidence.json`. The log loader checks the run identity
+and final log hash against `*_manifest.json`; changed or foreign artifacts are
+rejected. Each algorithm in a paired comparison has its own log-derived
+manifest, and preflight rejects a stale manifest before either algorithm trains.
+Read-only v2 evidence remains renderable for historical inspection, but it
+cannot supply learning-objective convergence without the selected return.
+
 The feature is HAPPO-only, including counterfactual-credit HAPPO. For the
 comparison entry point, select `--algorithms happo`. Existing output directories
 are rejected before training. Figures illustrate numerical consistency of the

@@ -18,7 +18,7 @@ from examples.train_cascade_parallel import (
     run_parallel_experiment, step_metrics_paths, plot_output_paths,
     trajectory_diagnostics_paths, checkpoint_directories,
     counterfactual_credit_paths, validate_correctness_output,
-    daily_change_paths, flatten_output_paths)
+    daily_change_paths, flatten_output_paths, run_artifact_manifest_path)
 from examples.plot_cascade_compare import validate_comparison
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 from harl.runners.cascade_mappo_runner import CascadeMAPPORunner
@@ -71,6 +71,7 @@ def comparison_preflight(args, config):
         log = algorithm_log_path(args.episode_log, algorithm)
         if log is not None:
             paths.append(log)
+            paths.append(run_artifact_manifest_path(log))
         paths.extend(step_metrics_paths(log, seeds).values())
         paths.extend(trajectory_diagnostics_paths(log, seeds, args.trajectory_diagnostics).values())
         paths.extend(checkpoint_directories(log, seeds, args.save_checkpoints).values())

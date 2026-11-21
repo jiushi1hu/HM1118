@@ -87,7 +87,7 @@ class CorrectnessWorkflowTest(unittest.TestCase):
                 parallel.run_parallel_experiment(self.data, self.physical,
                                                 copy.deepcopy(self.config), args)
             payload = json.loads((output/'evidence.json').read_text())
-            self.assertEqual(payload['schema'], 'cascade_correctness_v2')
+            self.assertEqual(payload['schema'], 'cascade_correctness_v3')
             self.assertEqual(payload['configuration']['correctness_diagnostics']['figures'],
                 ['mass_balance.png', 'water_levels.png', 'release_feasibility.png',
                  'storage_change.png', 'reward_reconciliation.png', 'happo_updates.png',
@@ -98,6 +98,12 @@ class CorrectnessWorkflowTest(unittest.TestCase):
             self.assertIn('operation_trajectory', run)
             self.assertTrue(run['update_records'][0]['critic_quality']['available'])
             self.assertTrue(run['evaluation_records'])
+            self.assertTrue((output/'manifest.json').is_file())
+            self.assertEqual(payload['run_id'], payload['provenance']['run_id'])
+            self.assertEqual(payload['configuration']['run_id'], payload['run_id'])
+            self.assertTrue((output/'manifest.json').is_file())
+            manifest_path = output/'manifest.json'
+            parallel.verify_artifact_manifest(manifest_path)
             self.assertEqual(len(run['storage_records']), 2+2*3+1)
             self.assertEqual(run['storage_summary']['training']['record_count'], 2)
             self.assertEqual(run['storage_summary']['training_evaluation']['record_count'], 6)

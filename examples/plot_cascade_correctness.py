@@ -18,6 +18,84 @@ VECTOR_FIELDS = ('storage_start', 'storage_end', 'levels_start', 'levels_end',
     'local_reward_penalties', 'local_rewards', 'mixed_rewards')
 SCALAR_REWARDS = ('reward', 'generation_reward', 'reward_penalty', 'global_reward', 'system_reward')
 QUANTILES = ('min', 'median', 'p95', 'max')
+EVIDENCE_SCHEMAS = ('cascade_correctness_v3', 'cascade_correctness_v2')
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _learning_return_kind(payload):
+    """Resolve the actual policy target from explicit objective provenance."""
+    objective = payload.get('learning_objective')
+    if objective is None:
+        configuration = payload.get('configuration', {})
+        objective = configuration.get('learning_objective')
+    if objective is None:
+        return 'legacy_unknown'
+    if not isinstance(objective, dict):
+        raise ValueError('learning_objective must be an evidence object')
+    source = objective.get('advantage_source')
+    if source in ('shared_team', 'counterfactual_shared_team'):
+        return 'shared_team'
+    if source == 'individual_mixed':
+        return 'individual_mixed'
+    raise ValueError('Unsupported learning objective: '+str(source))
+
+
+def _selected_return(record, kind):
+    """Read only the declared objective; legacy accounting is not a fallback."""
+    if record.get('status') == 'failed':
+        return None
+    if kind == 'legacy_unknown':
+        return None
+    field = ('system_evaluator_return' if kind == 'shared_team'
+             else 'mixed_evaluator_returns')
+    value = record.get(field)
+    if value is None:
+        raise ValueError('Missing '+field+' for declared learning objective '+kind)
+    if field == 'mixed_evaluator_returns':
+        values = _array(value, (5,), field)
+        return float(values.mean())
+    return float(_array(value, (), field))
+
+
+def _provenance_identity(payload):
+    """Reject evidence whose declared identity does not match its configuration."""
+    provenance, run_id = payload.get('provenance'), payload.get('run_id')
+    if not isinstance(provenance, dict) or provenance.get('schema') != 'cascade_run_provenance_v1':
+        raise ValueError('Evidence requires cascade_run_provenance_v1 provenance')
+    if not isinstance(run_id, str) or len(run_id) != 64 or provenance.get('run_id') != run_id:
+        raise ValueError('Evidence run_id must match its provenance identity')
+    configuration = payload.get('configuration')
+    if not isinstance(configuration, dict):
+        raise ValueError('Evidence requires its original configuration')
+    configured_provenance = configuration.get('provenance')
+    if isinstance(configured_provenance, dict):
+        configured_provenance = {key:value for key, value in configured_provenance.items()
+            if key not in ('artifact_manifest', 'artifact_inventory', 'continuation_provenance',
+                           'completion_record', 'artifact_manifest_integrity')}
+    if (configuration.get('run_id') != run_id or
+            configured_provenance != provenance):
+        raise ValueError('Evidence provenance disagrees with its configuration')
+    if payload.get('source_code_hashes') != provenance.get('source_code_hashes'):
+        raise ValueError('Evidence source hashes disagree with provenance')
+    if payload.get('data_hashes') != provenance.get('data_hashes'):
+        raise ValueError('Evidence data hashes disagree with provenance')
+    return provenance
+
+
+def validate_evidence_manifest(evidence_path):
+    """Verify the exclusive manifest that accompanies one evidence file."""
+    path = Path(evidence_path)
+    manifest_path = path.with_name('manifest.json')
+    if not manifest_path.is_file():
+        raise ValueError('Correctness evidence requires manifest.json beside it')
+    from examples.train_cascade_parallel import verify_artifact_manifest
+    manifest = verify_artifact_manifest(manifest_path)
+    evidence = json.loads(path.read_text(encoding='utf-8'))
+    if manifest.get('run_id') != evidence.get('run_id'):
+        raise ValueError('Correctness manifest and evidence belong to different runs')
+    return manifest
 
 
 def _array(value, shape, name):
@@ -43,8 +121,17 @@ def _finite_tree(value, name='evidence'):
 
 def validate_payload(payload):
     """Reject malformed evidence before allocating figures; preserve source values."""
-    if not isinstance(payload, dict) or payload.get('schema') != 'cascade_correctness_v2':
-        raise ValueError('Expected evidence schema cascade_correctness_v2')
+    if not isinstance(payload, dict) or payload.get('schema') not in EVIDENCE_SCHEMAS:
+        raise ValueError('Expected evidence schema cascade_correctness_v3 (or readable v2)')
+    if payload['schema'] == 'cascade_correctness_v3':
+        _provenance_identity(payload)
+        completion = payload.get('completion_status')
+        if completion not in ('complete', 'failed', 'partial'):
+            raise ValueError('Evidence completion_status must be complete, failed or partial')
+        if completion == 'complete' and not isinstance(payload.get('completion'), dict):
+            raise ValueError('Completed evidence requires its completion record')
+        if payload.get('learning_objective') is None:
+            raise ValueError('Evidence requires an explicit learning objective')
     _finite_tree(payload)
     runs = payload.get('runs')
     if not isinstance(runs, list) or not runs:
@@ -118,8 +205,12 @@ def validate_payload(payload):
                         _array([stats[q] for q in QUANTILES], (4,), key)
                 for key in ('factor_max_abs_error', 'factor_max_relative_error'):
                     _array(actor[key], (), key)
-        critic_quality = run.get('critic_quality')
-        if critic_quality is not None:
+        quality_scopes = [run.get('critic_quality')]
+        quality_scopes.extend(record.get('critic_quality')
+                              for record in run.get('update_records', []))
+        for critic_quality in quality_scopes:
+            if critic_quality is None:
+                continue
             if not isinstance(critic_quality, dict) or not isinstance(critic_quality.get('channels', []), list):
                 raise ValueError('critic_quality must be an evidence object with a channels list')
             previous_channel = -1
@@ -150,10 +241,14 @@ def validate_payload(payload):
                 value = record.get(key)
                 if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
                     raise ValueError('evaluation_records.'+key+' must be a nonnegative integer or null')
-            for key in ('evaluator_return', 'ecological_flow_violation_rate'):
+            for key in ('evaluator_return', 'system_evaluator_return',
+                        'learning_evaluator_return', 'ecological_flow_violation_rate'):
                 value = record.get(key)
                 if value is not None:
                     _array(value, (), 'evaluation_records.'+key)
+            mixed = record.get('mixed_evaluator_returns')
+            if mixed is not None:
+                _array(mixed, (5,), 'evaluation_records.mixed_evaluator_returns')
     return runs
 
 
@@ -423,11 +518,18 @@ def make_training_reliability_figure(payload):
             low[count == 0], high[count == 0] = np.nan, np.nan
             return mean, low, high
 
+        def critic_channel_sources(run):
+            scopes = [run.get('critic_quality', {})]
+            scopes.extend(record.get('critic_quality', {}) for record in run.get('update_records', [])
+                          if isinstance(record.get('critic_quality'), dict))
+            return [channel for scope in scopes for channel in scope.get('channels', [])
+                    if isinstance(channel, dict)]
+
         channel_numbers = sorted({channel.get('value_channel') for run in runs
-            for channel in run.get('critic_quality', {}).get('channels', [])})
+            for channel in critic_channel_sources(run)})
         for channel_number in channel_numbers:
             metadata = next((channel for run in runs
-                for channel in run.get('critic_quality', {}).get('channels', [])
+                for channel in critic_channel_sources(run)
                 if channel.get('value_channel') == channel_number), None)
             if metadata is None:
                 continue
@@ -480,9 +582,14 @@ def make_training_reliability_figure(payload):
                 ax.legend(handles, labels, fontsize=6, ncol=2, loc='best')
 
         convergence = axes[1]
+        learning_label = ('Shared-team system learning return'
+            if _learning_return_kind(payload) == 'shared_team'
+            else 'Mean individual mixed learning return'
+            if _learning_return_kind(payload) == 'individual_mixed'
+            else 'Unavailable: learning objective not declared')
         for ax, ylabel, title in zip(convergence, (
-                'Fixed-scenario return', 'Ecological-flow violation rate (%)', 'Return of final five rounds'),
-                ('Fixed-scenario evaluator return', 'Ecological-flow constraint frequency',
+                learning_label, 'Ecological-flow violation rate (%)', 'Return of final five rounds'),
+                ('Fixed-scenario learning return', 'Ecological-flow constraint frequency',
                  'Cross-seed final return spread')):
             ax.grid(alpha=.22)
             ax.set_ylabel(ylabel)
@@ -490,29 +597,43 @@ def make_training_reliability_figure(payload):
         convergence[0].set_xlabel('Evaluation round (policy update)')
         convergence[1].set_xlabel('Evaluation round (policy update)')
         convergence[2].set_xlabel('Seed and cross-seed aggregate')
-        evaluation_available = False
+        learning_kind = _learning_return_kind(payload)
+        evaluation_available = learning_kind != 'legacy_unknown'
         final_returns = []
-        for run_index, run in enumerate(runs):
-            records = [record for record in run.get('evaluation_records', [])
-                       if record.get('evaluator_return') is not None]
-            if not records:
-                continue
-            evaluation_available = True
-            color = colors(run_index % 10)
-            rounds = np.asarray([record['evaluation_round'] for record in records])
-            returns = np.asarray([record['evaluator_return'] for record in records], dtype=float)
-            convergence[0].plot(rounds, returns, color=color, lw=1., marker='o', ms=2.5,
-                                label='Seed '+str(run['seed']))
-            ecology = [(record['evaluation_round'], record['ecological_flow_violation_rate'])
-                       for record in records if record.get('ecological_flow_violation_rate') is not None]
-            if ecology:
-                convergence[1].plot([item[0] for item in ecology],
-                                    [100.*item[1] for item in ecology], color=color,
-                                    lw=1., marker='o', ms=2.5, label='Seed '+str(run['seed']))
-            final_returns.append((run['seed'], float(np.mean(returns[-5:])), color))
+        if learning_kind != 'legacy_unknown':
+            for run_index, run in enumerate(runs):
+                records = []
+                for record in run.get('evaluation_records', []):
+                    value = _selected_return(record, learning_kind)
+                    if value is None:
+                        continue
+                    declared = record.get('learning_evaluator_return')
+                    if (declared is not None and
+                            not np.isclose(float(declared), value, rtol=1e-10, atol=1e-10)):
+                        raise ValueError('learning_evaluator_return disagrees with the declared objective')
+                    records.append((record, value))
+                if not records:
+                    continue
+                color = colors(run_index % 10)
+                rounds = np.asarray([record['evaluation_round'] for record, _ in records])
+                returns = np.asarray([value for _, value in records], dtype=float)
+                convergence[0].plot(rounds, returns, color=color, lw=1., marker='o', ms=2.5,
+                                    label='Seed '+str(run['seed']))
+                ecology = [(record['evaluation_round'], record['ecological_flow_violation_rate'])
+                           for record, _ in records
+                           if record.get('ecological_flow_violation_rate') is not None]
+                if ecology:
+                    convergence[1].plot([item[0] for item in ecology],
+                                        [100.*item[1] for item in ecology], color=color,
+                                        lw=1., marker='o', ms=2.5, label='Seed '+str(run['seed']))
+                final_returns.append((run['seed'], float(np.mean(returns[-5:])), color))
         if not evaluation_available:
-            convergence[0].text(.5, .5, 'Unavailable: no evaluation history', ha='center', va='center',
+            convergence[0].text(.5, .5, 'Unavailable: learning objective not declared',
+                                ha='center', va='center',
                                 transform=convergence[0].transAxes)
+        elif not final_returns:
+            convergence[0].text(.5, .5, 'Unavailable: no declared-objective returns',
+                                ha='center', va='center', transform=convergence[0].transAxes)
         if not any(row.get('ecological_flow_violation_rate') is not None
                    for run in runs for row in run.get('evaluation_records', [])):
             convergence[1].text(.5, .5, 'Unavailable: no ecological-flow history', ha='center',
@@ -787,6 +908,15 @@ def main(argv=None):
             with path.open('xb') as stream:
                 figures[key].savefig(stream, format='png', dpi=125)
             print(str(path.resolve()))
+        if payload.get('schema') == 'cascade_correctness_v3' and args.input is not None:
+            from examples.train_cascade_parallel import (
+                verify_artifact_manifest, write_artifact_manifest)
+            manifest_path = args.output_dir/'manifest.json'
+            generated = [args.input]+list(targets.values())
+            manifest = write_artifact_manifest(manifest_path, payload['provenance'],
+                                               generated, root=args.output_dir)
+            verify_artifact_manifest(manifest_path)
+            print(str(manifest_path.resolve()))
         if not args.no_show:
             plt.show()
     finally:

@@ -78,6 +78,10 @@ def _context(payload):
     context = payload.get('comparison_context')
     if not isinstance(context, dict):
         raise ValueError('Every algorithm payload requires comparison_context')
+    if (payload.get('run_id') is not None and
+            (not isinstance(payload.get('provenance'), dict) or
+             payload['provenance'].get('run_id') != payload['run_id'])):
+        raise ValueError('Comparison payload run_id disagrees with its provenance')
     settings, hashes = context.get('shared_settings'), context.get('data_hashes')
     if not isinstance(settings, dict) or any(key not in settings for key in SHARED_FIELDS):
         raise ValueError('comparison_context.shared_settings requires: '+', '.join(SHARED_FIELDS))
@@ -238,6 +242,7 @@ def validate_comparison(payload):
     if not isinstance(runs, list) or not runs:
         raise ValueError('Comparison requires at least one algorithm run')
     normalized, names, reference, observation_reference = [], set(), None, None
+    run_ids = set()
     for entry in runs:
         if not isinstance(entry, dict) or not isinstance(entry.get('algorithm'), str):
             raise ValueError('Every run requires an algorithm name and legacy payload')
@@ -259,6 +264,10 @@ def validate_comparison(payload):
         identity = _canonical(context)
         if reference is not None and identity != reference:
             raise ValueError('Comparison settings or input data_hashes differ between algorithms')
+        if run.get('source_run_id') is not None and run['source_run_id'] in run_ids:
+            raise ValueError('HAPPO and MAPPO results must have different run identities')
+        if run.get('source_run_id') is not None:
+            run_ids.add(run['source_run_id'])
         reference = identity
         legacy.available_histories(run, 'histories')
         for rows in run.get('histories', []):
@@ -313,6 +322,10 @@ def load_comparison(happo_log=None, mappo_log=None):
             run['learning_objective'] = metadata['learning_objective']
         if 'actor_architecture' in metadata:
             run['actor_architecture'] = copy.deepcopy(metadata['actor_architecture'])
+        if 'run_id' in metadata:
+            run['source_run_id'] = metadata['run_id']
+        if 'provenance' in metadata:
+            run['source_provenance'] = copy.deepcopy(metadata['provenance'])
         runs.append(dict(algorithm=algorithm, payload=run))
     return validate_comparison(dict(schema=SCHEMA, runs=runs))
 

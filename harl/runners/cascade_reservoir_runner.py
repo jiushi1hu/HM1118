@@ -202,6 +202,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.worker_pids = []
 
     def _log_record(self, record):
+        if isinstance(record, dict) and getattr(self, 'run_id', None) is not None:
+            record.setdefault('run_id', self.run_id)
         log_episode(record, self.episode_log, console=getattr(self, 'verbose_console', False))
 
     def _log_ramp_conflicts(self, conflicts, phase, **context):
@@ -277,7 +279,11 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     def _annotate_learning_rewards(self, record):
         """Add provenance to one runtime record and its learning/window summaries."""
         metadata = self._learning_reward_metadata()
+        if getattr(self, 'run_id', None) is not None:
+            metadata['run_id'] = self.run_id
         record.update(metadata)
+        if isinstance(record.get('learning_rewards'), dict):
+            record['learning_rewards'].setdefault('run_id', metadata.get('run_id'))
         record['value_normalization_update'] = value_normalization_update_schedule(
             self.algorithm_name, getattr(self, 'value_normalizer', None) is not None)
         if isinstance(record.get('learning_rewards'), dict):

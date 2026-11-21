@@ -1,10 +1,15 @@
 """Orchestrate complete multi-year episodes and final held-out evaluation."""
 import hashlib
 import json
+import os
+import copy
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
+
+import numpy as np
 
 from harl.envs.cascade_reservoir.episodes import episode_environment, positive_integer, training_windows
 from harl.envs.cascade_reservoir.periodic_evaluation import (
@@ -31,6 +36,77 @@ ROOT=Path(__file__).resolve().parents[1]
 CORRECTNESS_FIGURES = ('mass_balance', 'water_levels', 'release_feasibility',
                        'storage_change', 'reward_reconciliation', 'happo_updates',
                        'operation_trajectories', 'training_reliability')
+PROVENANCE_SCHEMA = 'cascade_run_provenance_v1'
+EVIDENCE_SCHEMA = 'cascade_correctness_v3'
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024*1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                    allow_nan=False).encode('utf-8')).hexdigest()
+
+
+def new_run_provenance(metadata):
+    """Bind one invocation to immutable code, data and effective settings."""
+    created = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    identity = dict(schema=PROVENANCE_SCHEMA, created_utc=created,
+        pid=os.getpid(), parent_pid=os.getppid(),
+        data_hashes=metadata['data_hashes'],
+        source_code_hashes=metadata['source_code_hashes'],
+        config=metadata['config'], operation='training')
+    return dict(identity, run_id=_canonical_digest(identity),
+        source_tree_sha256=_canonical_digest(metadata['source_code_hashes']),
+        data_tree_sha256=_canonical_digest(metadata['data_hashes']))
+
+
+def _require_new_output_path(path, label):
+    path = Path(path)
+    if path.exists():
+        raise ValueError(label+' must name a new path: '+str(path))
+    return path
+
+
+def _record_transport_hashes(source_code_hashes):
+    """Hash only the three modules that carry exported records to a plot."""
+    modules = ('examples/train_cascade_parallel.py',
+               'harl/envs/cascade_reservoir/correctness_diagnostics.py',
+               'examples/plot_cascade_correctness.py')
+    normalized = {str(name).replace('\\', '/'):value
+                  for name, value in source_code_hashes.items()}
+    try:
+        return {name:normalized[name] for name in modules}
+    except KeyError as exc:
+        raise ValueError('Missing source hash for experiment transport: '+str(exc.args[0])) from exc
+
+
+def _learning_evaluation_return(learning_objective, record):
+    """Select the actual objective without falling back to legacy accounting."""
+    if record.get('status') == 'failed':
+        return None
+    source = learning_objective.get('advantage_source')
+    field = ('system_evaluator_return' if source in ('shared_team', 'counterfactual_shared_team')
+             else 'mixed_evaluator_returns' if source == 'individual_mixed' else None)
+    if field is None:
+        raise ValueError('Unsupported learning objective: '+str(source))
+    value = record.get(field)
+    if value is None:
+        raise ValueError('Missing '+field+' for declared learning objective '+source)
+    if field == 'mixed_evaluator_returns':
+        values = np.asarray(value, dtype=float)
+        if values.shape != (5,) or not np.isfinite(values).all():
+            raise ValueError('mixed_evaluator_returns must be five finite returns')
+        return float(values.mean())
+    value = float(value)
+    if not np.isfinite(value):
+        raise ValueError('system_evaluator_return must be finite')
+    return value
 
 
 def validate_correctness_output(directory, other_paths=()):
@@ -46,21 +122,34 @@ def validate_correctness_output(directory, other_paths=()):
             raise ValueError('correctness-output must be separate from other experiment outputs')
 
 
-def build_correctness_payload(runners, metadata, evaluations, evaluation_failure=None):
+def build_correctness_payload(runners, metadata, evaluations, evaluation_failure=None,
+                              completion=None):
     """Retain physical evidence, neutral endpoint inventories and HAPPO checks."""
+    learning_objective = metadata.get('learning_objective')
+    if not isinstance(learning_objective, dict):
+        raise ValueError('Correctness evidence requires learning-objective provenance')
+    if completion is not None and not isinstance(completion, dict):
+        raise ValueError('completion must be a run_complete mapping or None')
+    export_time = datetime.now(timezone.utc).isoformat(timespec='seconds')
     runs = []
     for runner in runners:
-        evaluation_records = [dict(
-            evaluation_round=int(record['evaluation_round']),
-            training_steps=int(record['training_steps']), status=record.get('status'),
-            evaluator_return=record.get('evaluator_return'),
-            return_basis=record.get('evaluator_return_aggregation'),
-            ecological_flow_violation_rate=record.get('ecological_flow_violation_rate'),
-            completed_window_count=record.get('completed_window_count'),
-            successful_window_count=record.get('successful_window_count'),
-            window_count=record.get('window_count'),
-            physical_feasible=record.get('physical_feasible'))
-            for record in runner.periodic_evaluation_history]
+        evaluation_records = []
+        for record in runner.periodic_evaluation_history:
+            learning_return = _learning_evaluation_return(learning_objective, record)
+            evaluation_records.append(dict(
+                evaluation_round=int(record['evaluation_round']),
+                training_steps=int(record['training_steps']), status=record.get('status'),
+                learning_evaluator_return=learning_return,
+                learning_return_basis=learning_objective['advantage_source'],
+                system_evaluator_return=record.get('system_evaluator_return'),
+                mixed_evaluator_returns=record.get('mixed_evaluator_returns'),
+                evaluator_return=record.get('evaluator_return'),
+                return_basis=record.get('evaluator_return_aggregation'),
+                ecological_flow_violation_rate=record.get('ecological_flow_violation_rate'),
+                completed_window_count=record.get('completed_window_count'),
+                successful_window_count=record.get('successful_window_count'),
+                window_count=record.get('window_count'),
+                physical_feasible=record.get('physical_feasible')))
         records = []
         def storage_record(row, phase, scenario_id, policy_update=None):
             completed = bool(row.get('completed', True)) and row.get('status') not in (
@@ -98,6 +187,11 @@ def build_correctness_payload(runners, metadata, evaluations, evaluation_failure
                            'evaluation', 'held_out_sequence')
             records[-1]['status'] = ('failed' if runner.seed == evaluation_failure['seed']
                                      else 'not_evaluated')
+        update_records = copy.deepcopy(runner.correctness_update_history)
+        quality_history = [record['critic_quality'] for record in update_records
+                           if isinstance(record.get('critic_quality'), dict)]
+        run_critic_quality = (copy.deepcopy(quality_history[-1]) if quality_history else dict(
+            available=False, reason='No per-update Critic fit evidence was recorded', channels=[]))
         runs.append(dict(seed=runner.seed, trajectory=runner.correctness_trajectory,
             operation_trajectory=getattr(runner, 'operation_trajectory', None),
             storage_records=records,
@@ -106,32 +200,160 @@ def build_correctness_payload(runners, metadata, evaluations, evaluation_failure
                 measured_count=sum(row['available'] for row in rows))
                 for phase in ('training', 'training_evaluation', 'evaluation')
                 for rows in [[row for row in records if row['phase'] == phase]]},
-            update_records=runner.correctness_update_history,
+            update_records=update_records,
+            critic_quality=run_critic_quality,
             evaluation_records=evaluation_records))
-    return dict(schema='cascade_correctness_v2', configuration=metadata, runs=runs,
+    provenance = copy.deepcopy(metadata['provenance'])
+    if provenance.get('run_id') != metadata.get('run_id'):
+        raise ValueError('Experiment provenance run_id does not match metadata')
+    return dict(schema=EVIDENCE_SCHEMA, provenance=provenance, run_id=provenance['run_id'],
+        exported_utc=export_time, completion_status=(
+            'failed' if evaluation_failure is not None else 'complete' if completion is not None
+            else 'partial'),
+        completion=copy.deepcopy(completion), configuration=metadata, runs=runs,
+        learning_objective=copy.deepcopy(learning_objective),
+        record_transport_hashes=_record_transport_hashes(metadata['source_code_hashes']),
+        source_code_hashes=copy.deepcopy(metadata['source_code_hashes']),
+        data_hashes=copy.deepcopy(metadata['data_hashes']),
         evaluation_failure=evaluation_failure,
         interpretation='Independent numerical consistency checks; endpoint storage changes are inventory accounting, not constraint violations',
         trajectory_scope='deterministic final-policy median training-only evaluation scenario per seed',
         operation_scope='deterministic final-policy operation over five complete calendar years from the selected median training-only window; leap days retained',
         storage_scope='all collected episodes, every periodic round and optional held-out sequence; compact initial/final inventories',
         update_scope='all training updates; bounded summaries, no additional optimizer steps',
-        training_reliability_scope='Critic fit against realized collected returns by unique value channel; fixed-scenario evaluator histories for every seed')
+        training_reliability_scope='Critic fit against realized collected returns by unique value channel; fixed-scenario learning-objective return histories for every seed')
+
+
+def _write_json_atomic(path, value):
+    """Replace only this invocation's evidence file after a complete JSON encode."""
+    path = Path(path)
+    if path.exists():
+        raise ValueError('Refusing to overwrite an existing experiment file: '+str(path))
+    temporary = path.with_name(path.name+'.tmp-'+str(os.getpid()))
+    try:
+        with temporary.open('x', encoding='utf-8') as stream:
+            json.dump(value, stream, allow_nan=False, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _artifact_entries(paths, root):
+    """Describe only files generated by this invocation, with stable relative names."""
+    root = Path(root).resolve()
+    entries, seen = [], set()
+    for value in paths:
+        path = Path(value)
+        if path.is_dir():
+            candidates = [item for item in path.rglob('*') if item.is_file() and item.name != 'manifest.json']
+            candidates.sort()
+        else:
+            candidates = [path]
+        for candidate in candidates:
+            candidate = candidate.resolve()
+            if candidate in seen or not candidate.is_file():
+                continue
+            try:
+                relative = candidate.relative_to(root).as_posix()
+            except ValueError:
+                relative = str(candidate)
+            entries.append(dict(path=relative, bytes=candidate.stat().st_size,
+                                sha256=_sha256_file(candidate)))
+            seen.add(candidate)
+    return sorted(entries, key=lambda row: row['path'])
+
+
+def write_artifact_manifest(path, provenance, paths, root=None):
+    """Write an exclusive inventory that detects stale or mixed experiment files."""
+    root = path.parent if root is None else Path(root)
+    manifest = dict(schema='cascade_artifact_manifest_v1', run_id=provenance['run_id'],
+        created_utc=datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        source_tree_sha256=provenance['source_tree_sha256'],
+        data_tree_sha256=provenance['data_tree_sha256'],
+        artifacts=_artifact_entries(paths, root))
+    _write_json_atomic(path, manifest)
+    return manifest
+
+
+def verify_artifact_manifest(path):
+    """Reject altered, missing or foreign-run artifacts; return the manifest."""
+    path = Path(path)
+    try:
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise ValueError('Cannot read artifact manifest: '+str(exc)) from exc
+    if not isinstance(manifest, dict) or manifest.get('schema') != 'cascade_artifact_manifest_v1':
+        raise ValueError('Unsupported artifact manifest schema')
+    run_id = manifest.get('run_id')
+    if not isinstance(run_id, str) or len(run_id) != 64:
+        raise ValueError('Artifact manifest requires a run_id')
+    entries = manifest.get('artifacts')
+    if not isinstance(entries, list) or not entries:
+        raise ValueError('Artifact manifest requires a nonempty artifacts list')
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError('Every artifact manifest entry must be an object')
+        relative = entry.get('path')
+        if not isinstance(relative, str) or not relative or relative in seen:
+            raise ValueError('Artifact paths must be distinct nonempty strings')
+        seen.add(relative)
+        artifact = Path(relative)
+        artifact = artifact if artifact.is_absolute() else path.parent/artifact
+        if not artifact.is_file():
+            raise ValueError('Artifact is missing: '+str(artifact))
+        if entry.get('bytes') != artifact.stat().st_size:
+            raise ValueError('Artifact size mismatch: '+str(artifact))
+        if entry.get('sha256') != _sha256_file(artifact):
+            raise ValueError('Artifact hash mismatch: '+str(artifact))
+    return manifest
 
 
 def save_correctness_outputs(runners, metadata, evaluations, directory, plot_python,
-                             evaluation_failure=None):
+                             evaluation_failure=None, completion=None):
     """Save evidence before rendering so a plot failure cannot erase the data."""
-    evidence = build_correctness_payload(runners, metadata, evaluations, evaluation_failure)
+    evidence = build_correctness_payload(runners, metadata, evaluations, evaluation_failure,
+                                         completion=completion)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     evidence_path = directory/'evidence.json'
-    with evidence_path.open('x', encoding='utf-8') as evidence_stream:
-        json.dump(evidence, evidence_stream, allow_nan=False, separators=(',', ':'))
+    _write_json_atomic(evidence_path, evidence)
     subprocess.run([plot_python,str(ROOT/'examples/plot_cascade_correctness.py'),
         '--input',str(evidence_path),'--output-dir',str(directory),'--no-show'],check=True,
         stdout=None if metadata.get('config', {}).get('experiment', {}).get('verbose_console', False)
                     else subprocess.DEVNULL)
+    manifest_path = directory/'manifest.json'
+    generated = [evidence_path]+[directory/(name+'.png') for name in CORRECTNESS_FIGURES]
+    # The renderer creates this manifest after sealing the evidence and figures.
+    # Verify that inventory instead of attempting to replace its exclusive file.
+    if manifest_path.exists():
+        manifest = verify_artifact_manifest(manifest_path)
+        if manifest.get('run_id') != metadata['run_id']:
+            raise ValueError('Correctness manifest and experiment belong to different runs')
+        expected = {Path(path).relative_to(directory).as_posix() for path in generated}
+        actual = {row['path'] for row in manifest['artifacts']}
+        if actual != expected:
+            raise ValueError('Correctness manifest does not bind every rendered artifact')
+    else:
+        manifest = write_artifact_manifest(manifest_path, metadata['provenance'], generated,
+                                           root=directory)
+    verify_artifact_manifest(manifest_path)
     print('Correctness evidence and eight figures saved to '+str(directory.resolve()),flush=True)
+    return dict(evidence=str(evidence_path.resolve()), manifest=str(manifest_path.resolve()),
+                artifacts=len(manifest['artifacts']))
+
+
+def run_artifact_manifest_path(episode_log=None, plot_output=None):
+    """Give every run one exclusive inventory of the artifacts it generated."""
+    if plot_output is not None:
+        return Path(plot_output).parent/'run_manifest.json'
+    if episode_log is not None:
+        path = Path(episode_log)
+        return path.with_name(path.stem+'_manifest.json')
+    return None
 
 
 def step_metrics_paths(episode_log, seeds):
@@ -448,6 +670,17 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     metadata['comparison_context']=comparison_context
     metadata['actor_architecture']=actor_architecture
     metadata['learning_objective']=learning_objective
+    metadata['provenance']=new_run_provenance(metadata)
+    metadata['run_id']=metadata['provenance']['run_id']
+    artifact_manifest_path=run_artifact_manifest_path(args.episode_log,
+                                                       getattr(args, 'plot_output', None))
+    if artifact_manifest_path is not None:
+        output_paths.append(artifact_manifest_path)
+    if len({path.resolve() for path in output_paths}) != len(output_paths):
+        raise ValueError('Run artifact manifest must be separate from other experiment outputs')
+    for path in output_paths:
+        if path.exists():
+            raise ValueError('Output file already exists: '+str(path))
     if correctness_enabled:
         metadata['correctness_diagnostics'] = dict(enabled=True,
             output_directory=str(Path(correctness_dir).resolve()),
@@ -538,8 +771,15 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                                           checkpoint_dir=checkpoint_dirs.get(seed),
                                           ramp_conflict_log=conflict_writers.get(seed),
                                           **credit_options)
+            runner.run_id=metadata['run_id']
             runner.run(episodes,interval)
             runners.append(runner)
+        # Normalize any legacy learning rows that were produced before the run
+        # identity was attached; training and optimization are already complete.
+        for runner in runners:
+            for record in runner.episode_history:
+                if isinstance(record.get('learning_rewards'), dict):
+                    record['learning_rewards']['run_id'] = metadata['run_id']
         evaluations=[]
         daily_change_files={}
         if not args.skip_final_evaluation:
@@ -556,13 +796,26 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                     except (OSError, ValueError, subprocess.CalledProcessError) as output_error:
                         print('Correctness output failed after evaluation failure: '+str(output_error),
                               file=sys.stderr)
+                if artifact_manifest_path is not None:
+                    write_artifact_manifest(artifact_manifest_path, metadata['provenance'],
+                        [path for path in [args.episode_log, correctness_dir]
+                         if path is not None and Path(path).exists()])
                 raise
         if daily_change_paths_by_seed:
             daily_change_files=save_daily_change_outputs(
                 runners, daily_change_paths_by_seed, args.plot_python, verbose_console)
             print('Daily level/release change CSV and figures saved to '+
                   str(daily_change_directory.resolve()),flush=True)
-        result=dict(record_type='run_complete',seeds=config['experiment']['seeds'],
+        provenance=dict(metadata['provenance'],
+            artifact_inventory='files physically generated by this invocation, excluding the manifest itself',
+            artifact_manifest=(None if artifact_manifest_path is None
+                               else str(artifact_manifest_path.resolve())),
+            continuation_provenance='pre-run source, data and settings plus run_id; it is not a hash of the growing log or artifacts',
+            completion_record='run_complete in the episode log when --episode-log is supplied',
+            artifact_manifest_integrity=('manifest.json beside evidence is initially verified by the renderer; '
+                                         'run_manifest.json is written after all outputs are final'))
+        result=dict(record_type='run_complete',run_id=metadata['run_id'],
+            provenance=provenance,seeds=config['experiment']['seeds'],
             episode_horizon_days=days,parallel_environments=count,episodes_per_seed=episodes,
             training_steps_per_seed=[runner.training_steps for runner in runners],
             completed_episodes_per_seed=[runner.completed_episodes for runner in runners],
@@ -577,11 +830,14 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             evaluation_skipped=bool(args.skip_final_evaluation),evaluations=evaluations,
             learning_objective=learning_objective,
             daily_change_diagnostics=dict(enabled=bool(daily_change_files),
-                files=daily_change_files,
+                files=daily_change_files,artifact_manifest=(None if artifact_manifest_path is None
+                    else str(artifact_manifest_path.resolve())),
                 difference_rule='current minus previous in episode order; first daily difference is missing'))
         log_episode(result,stream,console=verbose_console)
+        correctness_output=None
         if correctness_enabled:
-            save_correctness_outputs(runners, metadata, evaluations, correctness_dir, args.plot_python)
+            correctness_output=save_correctness_outputs(
+                runners, metadata, evaluations, correctness_dir, args.plot_python, completion=result)
         payload=json.loads(json.dumps(dict(episode_horizon_days=days,gamma=config['algo']['gamma'],
             seeds=config['experiment']['seeds'],updates_per_seed=episodes//count,
             periodic_evaluation=dict(windows=periodic_windows),
@@ -589,6 +845,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             evaluation_histories=[runner.periodic_evaluation_history for runner in runners],
             algorithm=algorithm_name or 'happo',comparison_context=comparison_context,
             actor_architecture=actor_architecture,learning_objective=learning_objective,
+            run_id=metadata['run_id'],provenance=metadata['provenance'],
             daily_change_diagnostics=dict(enabled=bool(daily_change_files),
                 files=daily_change_files)),allow_nan=False))
         if not args.no_plot:
@@ -600,6 +857,18 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             subprocess.run(plot_command,
                 input=json.dumps(payload,allow_nan=False),text=True,check=True,
                 stdout=None if verbose_console else subprocess.DEVNULL)
+        if artifact_manifest_path is not None:
+            generated=([args.episode_log] if args.episode_log is not None else []) + \
+                flatten_output_paths(daily_change_paths_by_seed)+list(figure_paths.values()) + \
+                list(trajectory_paths.values())+list(checkpoint_dirs.values())+list(credit_paths.values()) + \
+                ([correctness_dir] if correctness_output is not None else [])
+            write_artifact_manifest(artifact_manifest_path,metadata['provenance'],generated)
+            if args.episode_log is not None:
+                verify_artifact_manifest(artifact_manifest_path)
+                manifest_artifacts={row['path'] for row in
+                    verify_artifact_manifest(artifact_manifest_path)['artifacts']}
+                if Path(args.episode_log).name not in manifest_artifacts:
+                    raise ValueError('Run manifest does not bind the episode log')
     if verbose_console:
         print('Finished multi-year experiment. Training resume is not implemented; '
               'evaluation checkpoints are saved when --save-checkpoints is enabled. '

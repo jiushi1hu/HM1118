@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from examples import plot_cascade_correctness as plots
+from examples import train_cascade_parallel as parallel
 
 FIGURES = ('mass_balance', 'water_levels', 'release_feasibility',
            'storage_change', 'reward_reconciliation', 'happo_updates',
@@ -35,7 +36,7 @@ def stats(value, count=4):
     return dict(count=count, min=value, median=value, p95=value, max=value)
 
 
-def fixture(steps=2, failed=False):
+def fixture(steps=2, failed=False, schema='cascade_correctness_v3'):
     """Hand-calculated constant-storage daily chain, with two actor updates."""
     release = np.array([5., 10., 20., 30., 40.])
     power = .8829*release
@@ -144,19 +145,35 @@ def fixture(steps=2, failed=False):
             fitted_reward_basis='mixed_reward', channels=copy.deepcopy(quality_channels))
     evaluation_records = [dict(evaluation_round=round_number,
         training_steps=round_number*4, status='ok', evaluator_return=70.+2.*round_number,
+        system_evaluator_return=30.+3.*round_number,
+        mixed_evaluator_returns=[20.+round_number+channel for channel in range(5)],
+        learning_evaluator_return=30.+3.*round_number,
+        learning_return_basis='shared_team',
         return_basis='mean over fixed scenarios', ecological_flow_violation_rate=.15-.015*round_number,
         completed_window_count=3, successful_window_count=3, window_count=3, physical_feasible=True)
         for round_number in range(6)]
-    return dict(schema='cascade_correctness_v2',
-        configuration=dict(episode_horizon_days=2, parallel_environments=2,
-            episodes_per_seed=4, updates_per_seed=2,
-            physical_config=dict(head_model='fixed', efficiency=.9, water_density_kg_m3=1000., gravity_m_s2=9.81,
-                timestep_seconds=86400., level_bounds_m={name:[0., 100.] for name in IDS},
-                reward_penalties=dict(enabled=True, ecological_flow_weight=1.)),
-            config=dict(algo=dict(gamma=.995, clip_param=.2),
-                experiment=dict(seeds=[1]), train=dict(episode_length=2, n_rollout_threads=2),
-                model=dict(action_bins=3)),
-            data_hashes={'inflow.csv':'a'*64}, source_code_hashes={'harl/example.py':'b'*64}),
+    configuration = dict(episode_horizon_days=2, parallel_environments=2,
+        episodes_per_seed=4, updates_per_seed=2,
+        physical_config=dict(head_model='fixed', efficiency=.9, water_density_kg_m3=1000., gravity_m_s2=9.81,
+            timestep_seconds=86400., level_bounds_m={name:[0., 100.] for name in IDS},
+            reward_penalties=dict(enabled=True, ecological_flow_weight=1.)),
+        config=dict(algo=dict(gamma=.995, clip_param=.2),
+            experiment=dict(seeds=[1]), train=dict(episode_length=2, n_rollout_threads=2),
+            model=dict(action_bins=3)),
+        data_hashes={'inflow.csv':'a'*64}, source_code_hashes={'harl/example.py':'b'*64},
+        learning_objective=dict(advantage_source='shared_team',
+            critic_reward_layout='shared_team', actor_value_channels=[0]*5))
+    provenance = dict(schema='cascade_run_provenance_v1', created_utc='2026-11-21T00:00:00+00:00',
+        pid=1, parent_pid=1, data_hashes=configuration['data_hashes'],
+        source_code_hashes=configuration['source_code_hashes'], config=configuration['config'],
+        operation='training', run_id='a'*64,
+        source_tree_sha256='b'*64, data_tree_sha256='c'*64)
+    configuration['provenance'], configuration['run_id'] = provenance, provenance['run_id']
+    return dict(schema=schema, provenance=provenance, run_id=provenance['run_id'],
+        exported_utc='2026-11-21T00:01:00+00:00', completion_status='failed' if failed else 'complete',
+        completion=dict(record_type='run_complete', run_id=provenance['run_id']),
+        learning_objective=configuration['learning_objective'], configuration=configuration,
+        source_code_hashes=configuration['source_code_hashes'], data_hashes=configuration['data_hashes'],
         interpretation='Independent consistency checks; not proof of hydraulic calibration or optimality.',
         trajectory_scope='deterministic final-policy median training-only evaluation scenario per seed',
         update_scope='all training updates; bounded summaries',
@@ -328,6 +345,11 @@ class CorrectnessPlotCLITest(unittest.TestCase):
             for path in images.values():
                 self.assertTrue(path.is_file(), str(path))
                 self.assertEqual(path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+            manifest = json.loads((target/'manifest.json').read_text(encoding='utf-8'))
+            self.assertEqual(manifest['run_id'], fixture()['run_id'])
+            self.assertEqual({row['path'] for row in manifest['artifacts']},
+                             {'evidence.json'}|{name+'.png' for name in FIGURES})
+            parallel.verify_artifact_manifest(target/'manifest.json')
             previous = {name:path.read_bytes() for name, path in images.items()}
             result = self.command('--input', evidence, '--output-dir', target, '--no-show', directory=directory)
             self.assertNotEqual(result.returncode, 0)
