@@ -9,6 +9,8 @@ from harl.envs.cascade_reservoir.training_metrics import log_step, step_record
 from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 from harl.envs.cascade_reservoir.reward import (
     EpisodeRewardMetrics, validate_discount_factor, REWARD_AGGREGATION, reward_metadata)
+from harl.envs.cascade_reservoir.feasibility_ablation import (
+    FeasibilityRecorder, level_trajectory_summary)
 
 
 def episode_constraint_status(*, completed, physical_feasible, service_shortfalls=None):
@@ -111,6 +113,7 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
     initial = env.storage.copy()
     limit_metrics = DailyLimitMetrics(env)
     reward_metrics = EpisodeRewardMetrics(gamma)
+    feasibility = FeasibilityRecorder(env.physics.feasibility_mode)
     energy, spill, residual = 0., 0., 0.
     energy_by_reservoir, spill_by_reservoir = np.zeros(5), np.zeros(5)
     action_sum, mapped_sum, active_count = np.zeros(5), np.zeros(5), np.zeros(5)
@@ -134,6 +137,7 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
                 episode_step=env.index-env.start, phase=phase,
                 training_steps=training_steps), step_log)
         reward_metrics.update(row)
+        feasibility.capture(row)
         energy += float(row['energy'].sum())
         spill += float(row['spill'].sum()*env.physics.dt)
         residual = max(residual, float(np.abs(row['residual']).max()))
@@ -168,6 +172,8 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
         raise
     result.update(reward_metrics.summary(detailed=True), **reward_metadata(data),
         reward_penalties=env.reward_settings, reward_aggregation=REWARD_AGGREGATION)
+    result.update(feasibility.summary())
+    result['level_trajectory'] = level_trajectory_summary([feasibility])
     result.update(episode_constraint_status(completed=True, physical_feasible=True,
         service_shortfalls=result['service_shortfalls']))
     if diagnostics:

@@ -110,7 +110,7 @@ def log_step(record, writer):
 
 
 def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
-                   gae_lambda, failed_episodes, failure=None):
+                   gae_lambda, failed_episodes, failure=None, feasibility=None):
     """Describe real executed days; a rejected transition contributes no energy.
 
     Failure rates count failed episode attempts, not soft reservoir-day events.
@@ -141,7 +141,7 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
     from harl.envs.cascade_reservoir.evaluation import episode_constraint_status
     constraints = episode_constraint_status(completed=completed, physical_feasible=not failed,
         service_shortfalls=rewards.shortfall_summary())
-    return dict(record_type='training_episode', seed=int(seed), episode=int(episode),
+    record = dict(record_type='training_episode', seed=int(seed), episode=int(episode),
         window_start_year=int(env.data.dates[env.start].year), **constraints,
         source_years=list(dict.fromkeys(day.year for day in env.data.dates[env.start:env.stop])),
         episode_horizon_days=int(env.stop-env.start),
@@ -167,6 +167,9 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
         reward_penalties=dict(env.reward_settings), reference_energy_MWh=env.physics.reference_energy,
         **storage_change_summary(env.initial_storage, env.storage),
         release_bounds_scope='current_transition')
+    if feasibility is not None:
+        record.update(feasibility)
+    return record
 
 
 def log_episode(record, stream=None, *, console=False):

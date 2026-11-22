@@ -14,6 +14,8 @@ from harl.envs.cascade_reservoir.data_loader import (
 from harl.envs.cascade_reservoir.episodes import positive_integer
 from harl.envs.cascade_reservoir.reward import reward_settings, validate_discount_factor
 from harl.envs.cascade_reservoir.level_ramp import daily_level_ramp_limits
+from harl.envs.cascade_reservoir.dispatch_kernel import (
+    FEASIBILITY_MODES, validate_feasibility_mode)
 from harl.envs.cascade_reservoir.training_sampler import SAMPLING_MODES, validate_sampling_mode
 from harl.runners.cascade_reservoir_runner import (
     validate_gae_lambda, validate_seed, validate_credit_assignment)
@@ -55,6 +57,9 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
                         help='Maximum candidate rows per batched physics/critic call (default: 4096)')
     parser.add_argument('--ppo-epochs',type=int,help='Actor optimization epochs per collection round')
     parser.add_argument('--head-model',choices=HEAD_MODELS)
+    parser.add_argument('--feasibility-mode',choices=FEASIBILITY_MODES,
+                        help='Release feasibility: backward (original downstream-to-upstream propagation) '
+                             'or forward_local (ablation without propagation)')
     parser.add_argument('--ecological-flow-scale',type=float,
                         help='Positive multiplier for reference ecological-flow thresholds; defaults to environment YAML, 1 restores reference values')
     limits = parser.add_mutually_exclusive_group()
@@ -128,6 +133,8 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
         algo['counterfactual_batch_size'] = args.counterfactual_batch_size
     if args.head_model is not None:
         physical['head_model'] = args.head_model
+    if args.feasibility_mode is not None:
+        physical['feasibility_mode'] = args.feasibility_mode
     for name in ('ecological_flow_scale',):
         value = getattr(args,name)
         if value is not None:
@@ -171,6 +178,8 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
         for name in ('ecological_flow_scale',):
             physical[name] = validate_service_scale(physical.get(name,1.),name)
         daily_level_ramp_limits(physical)
+        physical['feasibility_mode'] = validate_feasibility_mode(
+            physical.get('feasibility_mode','backward'))
         reward_settings(physical)
         split = resolve_year_split(exp)
         exp.update({name:list(values) for name,values in split.items()})

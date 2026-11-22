@@ -185,7 +185,12 @@ class CascadeReservoirEnv:
                         remaining_regulation='(normal_storage - storage) / operating_storage_span',
                         system_storage='total storage / combined normal storage',
                         system_power='total power / total installed capacity'),
-                    end_storage_policy='unconstrained_within_daily_operating_bounds')
+                    end_storage_policy='unconstrained_within_daily_operating_bounds',
+                    feasibility_mode=self.physics.feasibility_mode,
+                    feasibility_mode_definition=(
+                        'backward: downstream-to-upstream storage compatibility propagated before dispatch' if
+                        self.physics.feasibility_mode == 'backward' else
+                        'forward_local: each reservoir bounded only by its own storage interval; no upstream propagation'))
 
     def __init__(self, data, config, start_year=None, action_bins=DEFAULT_ACTION_BINS,
                  episode_days=DEFAULT_EPISODE_DAYS):

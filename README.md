@@ -107,6 +107,32 @@ outlet capacities and downstream compatibility. Physically forced intervals
 mask actor learning and contribute a unit HAPPO correction factor. The default
 100-command grid can be changed with `--action-bins`.
 
+`feasibility_mode` in `cascade_reservoir.yaml` selects how downstream
+compatibility enters the interval, and `--feasibility-mode` overrides it per run:
+
+- `backward` (default, original): each reservoir's interval is propagated
+  upstream from the downstream storage envelope before any release is chosen, so
+  one joint command vector is feasible for the whole cascade.
+- `forward_local` (ablation): the propagation pass is disabled. Each reservoir is
+  bounded only by its own storage interval, capacity and level ramps, and the
+  upstream release still becomes the next reservoir's inflow. A reservoir whose
+  interval is empty raises `InfeasibleCascade` with per-reservoir conflict
+  evidence; nothing is clipped, relaxed, or rounded to stay feasible.
+
+Both modes record `forced_interval`, `empty_interval`,
+`release_interval_fraction` and `feasibility_mode` on every transition, and
+episode and evaluation records carry forced/empty counts, infeasible-interval
+rates, mass-balance residuals and level trajectories.
+
+The paired ablation runs both modes with the same seeds and settings:
+
+```bash
+python -B examples/run_feasibility_ablation.py --episodes 60 --seeds 1 2 3
+```
+
+It writes `ablation_report.md`, `ablation_summary.json` and three figures under
+`runs/feasibility_ablation/`.
+
 Generation uses turbine flow, installed capacity and net head. The default
 `storage_sensitivity` head model depends on mean start/end forebay elevation and
 supplied slope/offset assumptions; this is a sensitivity model. `--head-model

@@ -8,7 +8,8 @@ and numerical tolerances match the scalar implementation.
 import numpy as np
 
 from harl.envs.cascade_reservoir.data_loader import IDS
-from harl.envs.cascade_reservoir.dispatch_kernel import InfeasibleCascade, dispatch_release
+from harl.envs.cascade_reservoir.dispatch_kernel import (
+    InfeasibleCascade, dispatch_release, DEFAULT_FEASIBILITY_MODE)
 
 
 def _matrix(value, name, shape=None):
@@ -77,7 +78,9 @@ def batched_transition(physics, storage, external, actions,
     if ((storage < data.vmin-1.) | (storage > data.vmax+1.)).any():
         raise InfeasibleCascade('Starting storage violates operating bounds')
     dispatch = dispatch_release(storage, external, actions, storage_min, storage_max,
-                                data.release_cap, dt)
+                                data.release_cap, dt,
+                                feasibility_mode=getattr(physics, 'feasibility_mode',
+                                                         DEFAULT_FEASIBILITY_MODE))
     inflow, release = dispatch['inflow'], dispatch['release']
     next_storage = storage+(inflow-release)*dt
     residual = next_storage-storage-(inflow-release)*dt
@@ -120,6 +123,10 @@ def batched_transition(physics, storage, external, actions,
         net_head_m=head, effective_turbine_cap_m3s=cap.copy(), turbine=turbine,
         spill=release-turbine, power=power, energy=energy,
         reward=energy.sum(axis=1)/physics.reference_energy, system_residual=system_residual)
+    result.update(forced_actor_days=result['forced_interval'].sum(axis=1).astype(np.int64),
+        empty_interval_days=result['empty_interval'].sum(axis=1).astype(np.int64),
+        release_interval_fraction=(result['high']-result['low'])/np.maximum(
+            np.broadcast_to(data.release_cap, shape), 1e-12))
     if storage_lower is not None:
         result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
     return result

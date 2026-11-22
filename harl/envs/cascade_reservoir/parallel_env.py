@@ -6,10 +6,11 @@ import numpy as np
 from harl.envs.cascade_reservoir.episodes import episode_environment, positive_integer
 from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics
 from harl.envs.cascade_reservoir.training_metrics import episode_record
+from harl.envs.cascade_reservoir.feasibility_ablation import FeasibilityRecorder
 
 
 def _worker(connection):
-    env = metrics = energy = None
+    env = metrics = energy = recorder = None
     episode = 0
     try:
         # A small startup message avoids blocking Process.start() while it
@@ -28,10 +29,11 @@ def _worker(connection):
                 return
             try:
                 if command == 'reset':
-                    env = metrics = energy = None
+                    env = metrics = energy = recorder = None
                     years, episode = value
                     env = episode_environment(data, physical, years, days, bins)
                     metrics, energy = EpisodeRewardMetrics(gamma), np.zeros(5)
+                    recorder = FeasibilityRecorder(env.physics.feasibility_mode)
                     result = dict(obs=env.actor_observations(), state=env.state(), pid=os.getpid())
                 elif command == 'step':
                     if env is None or env.index >= env.stop:
@@ -39,13 +41,15 @@ def _worker(connection):
                     env.step(value)
                     transition = env.last_transition
                     metrics.update(transition)
+                    recorder.capture(transition)
                     energy += transition['energy']
                     done = env.index == env.stop
                     result = dict(obs=env.actor_observations(), state=env.state(),
                                   transition=transition, done=done)
                     if done:
                         record = episode_record(env, metrics, energy, seed, episode,
-                                                gamma, trace, 0)
+                                                gamma, trace, 0,
+                                                feasibility=recorder.summary())
                         record['worker_pid'] = os.getpid()
                         result.update(episode_record=record, reward_metrics=metrics.summary())
                 else:
@@ -57,7 +61,8 @@ def _worker(connection):
                     try:
                         failure = episode_record(env, metrics, energy, seed, episode, gamma, trace, 1,
                             dict(error_type=type(exc).__name__, reason=str(exc),
-                                 conflicts=list(getattr(exc, 'conflicts', []))))
+                                 conflicts=list(getattr(exc, 'conflicts', []))),
+                            feasibility=recorder.summary() if recorder is not None and recorder.days else None)
                     except Exception:
                         pass  # Preserve the original worker error if accounting also fails.
                 connection.send((False, dict(error=repr(exc), traceback=traceback.format_exc(),

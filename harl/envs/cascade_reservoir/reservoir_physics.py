@@ -2,7 +2,8 @@
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import HEAD_MODELS
 from harl.envs.cascade_reservoir.dispatch_kernel import (
-    InfeasibleCascade, dispatch_release)
+    InfeasibleCascade, dispatch_release, validate_feasibility_mode,
+    DEFAULT_FEASIBILITY_MODE)
 
 
 class ReservoirPhysics:
@@ -24,6 +25,8 @@ class ReservoirPhysics:
         self.head_model = config.get("head_model", "fixed")
         if self.head_model not in HEAD_MODELS:
             raise ValueError("Unknown head model: " + str(self.head_model))
+        self.feasibility_mode = validate_feasibility_mode(
+            config.get("feasibility_mode", DEFAULT_FEASIBILITY_MODE))
         self.rho_g_eta = density * gravity * eta
         self.head_data_status = "supplied_typical_head"
         if self.head_model == "fixed":
@@ -123,12 +126,17 @@ class ReservoirPhysics:
         if ((storage < d.vmin - 1) | (storage > d.vmax + 1)).any():
             raise InfeasibleCascade("Starting storage violates operating bounds")
         dispatched = dispatch_release(storage[None], external[None], actions[None],
-            storage_min[None], storage_max[None], d.release_cap, self.dt)
+            storage_min[None], storage_max[None], d.release_cap, self.dt,
+            feasibility_mode=self.feasibility_mode)
         def unbatch(value):
             if isinstance(value, dict):
                 return {key:unbatch(item) for key, item in value.items()}
             item = value[0]
-            return item.copy() if isinstance(item, np.ndarray) else item.item()
+            if isinstance(item, np.ndarray):
+                return item.copy()
+            if isinstance(item, np.generic):
+                return item.item()
+            return item
         dispatch = {key:unbatch(value) for key, value in dispatched.items()}
         inflow, release = dispatch['inflow'], dispatch['release']
         next_storage = storage + (inflow - release) * self.dt
@@ -149,6 +157,15 @@ class ReservoirPhysics:
                     external=external.copy(), residual=residual,
                     reward=float(energy.sum() / self.reference_energy),
                     system_residual=float(system_residual), **dispatch, **generated)
+        result.update(feasibility_mode=self.feasibility_mode,
+            forced_interval=np.asarray(dispatch['forced_interval'], dtype=bool).copy(),
+            empty_interval=np.asarray(dispatch['empty_interval'], dtype=bool).copy(),
+            forced_actor_days=int(result['forced_interval'].sum()),
+            empty_interval_days=int(result['empty_interval'].sum()),
+            # Fractional width of the executed interval, so a nearly collapsed
+            # day is visible even when it is not exactly forced.
+            release_interval_fraction=((result['high']-result['low']) /
+                                       np.maximum(d.release_cap, 1e-12)).copy())
         if storage_lower is not None:
             result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
         return result

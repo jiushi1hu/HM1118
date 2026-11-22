@@ -150,7 +150,12 @@ class BatchedPhysicsTest(unittest.TestCase):
             env, _ = synthetic_dispatch(head_model=head_model)
             result = batched_transition(env.physics, np.empty((0,5)), np.empty((0,5)), np.empty((0,5)))
             for name, value in result.items():
-                self.assertEqual(value.shape, (0,) if name in ('reward','system_residual') else (0,5))
+                if name == 'feasibility_mode':
+                    self.assertEqual(value, env.physics.feasibility_mode)
+                    continue
+                per_row = ('reward', 'system_residual', 'forced_actor_days',
+                           'empty_interval_days')
+                self.assertEqual(value.shape, (0,) if name in per_row else (0,5))
 
 
 if __name__ == '__main__':

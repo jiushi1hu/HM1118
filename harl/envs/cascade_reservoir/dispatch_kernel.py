@@ -5,6 +5,21 @@ from harl.envs.cascade_reservoir.data_loader import IDS
 
 FLOW_TOLERANCE = 1e-8
 
+# Release-feasibility ablations. ``backward`` is the original kernel: the
+# downstream storage envelope is propagated upstream so a joint release choice
+# is feasible for every reservoir at once. ``forward_local`` disables that
+# propagation and keeps only each reservoir's own storage interval, applied as
+# releases are computed upstream to downstream.
+FEASIBILITY_MODES = ('backward', 'forward_local')
+DEFAULT_FEASIBILITY_MODE = 'backward'
+
+
+def validate_feasibility_mode(mode):
+    """Return a supported propagation mode; reject everything else."""
+    if not isinstance(mode, str) or mode not in FEASIBILITY_MODES:
+        raise ValueError('feasibility_mode must be one of '+str(list(FEASIBILITY_MODES)))
+    return mode
+
 
 class InfeasibleCascade(RuntimeError):
     """A physical infeasibility that may carry machine-readable evidence."""
@@ -59,13 +74,20 @@ def _backward(storage, external, storage_lower, storage_upper, release_cap, dt):
 
 
 def dispatch_release(storage, external, actions, storage_lower, storage_upper,
-                     release_cap, dt):
+                     release_cap, dt, feasibility_mode=DEFAULT_FEASIBILITY_MODE):
     """Return release dispatch for independent rows, each with five reservoirs.
 
     Inputs are ``(N,5)`` arrays; release_cap may also be a five-vector.
     All returned arrays retain the leading row dimension, including diagnostics.
     No input is modified. Empty batches are supported.
+
+    ``feasibility_mode='backward'`` is the original downstream-to-upstream
+    propagation. ``feasibility_mode='forward_local'`` is the ablation: each
+    reservoir is bounded only by its own storage interval and capacity, with
+    the resulting upstream release still passed downstream as inflow.
+    Infeasible intervals raise in both modes; nothing is clipped or relaxed.
     """
+    feasibility_mode = validate_feasibility_mode(feasibility_mode)
     storage = _matrix(storage, 'Storage')
     shape = storage.shape
     external = _matrix(external, 'External inflow', shape)
@@ -78,25 +100,32 @@ def dispatch_release(storage, external, actions, storage_lower, storage_upper,
     if ((external < 0.).any() or (actions < 0.).any() or (actions > 1.).any() or
             (cap <= 0.).any() or (storage_lower > storage_upper).any()):
         raise ValueError('Invalid forcing, actions, capacity or storage bounds')
-    physical_lower, physical_upper, physical_conflict = _backward(
-        storage, external, storage_lower, storage_upper, cap, dt)
-    if physical_conflict.any():
-        raise InfeasibleCascade('Empty physically compatible release interval',
-            conflicts=_release_conflicts(physical_lower, physical_upper,
-                physical_conflict, 'cascade_storage_compatibility'))
-    lower, upper = physical_lower, physical_upper
+    if feasibility_mode == 'backward':
+        physical_lower, physical_upper, physical_conflict = _backward(
+            storage, external, storage_lower, storage_upper, cap, dt)
+        if physical_conflict.any():
+            raise InfeasibleCascade('Empty physically compatible release interval',
+                conflicts=_release_conflicts(physical_lower, physical_upper,
+                    physical_conflict, 'cascade_storage_compatibility'))
+        lower, upper = physical_lower, physical_upper
+    else:
+        # Forward-only ablation: no downstream storage compatibility is
+        # propagated upstream. Each reservoir keeps its own bounds and capacity.
+        lower, upper = np.zeros_like(storage), cap.copy()
     inflow, release, low, high = [np.empty(shape) for _ in range(4)]
     controls = np.ones(shape, dtype=np.float32)
     executed = actions.copy()
+    empty = np.zeros(shape, dtype=bool)
     for i in range(5):
         inflow[:, i] = external[:, i]+(release[:, i-1] if i else 0.)
         low[:, i] = np.maximum(lower[:, i], inflow[:, i]+(storage[:, i]-storage_upper[:, i])/dt)
         high[:, i] = np.minimum(upper[:, i], inflow[:, i]+(storage[:, i]-storage_lower[:, i])/dt)
         if (low[:, i] > high[:, i]+FLOW_TOLERANCE).any():
             failed = (low[:, i] > high[:, i]+FLOW_TOLERANCE)
+            empty[failed, i] = True
             raise InfeasibleCascade('Empty feasible release interval at reservoir '+str(i),
                 conflicts=[dict(row=int(row), reservoir=IDS[i], reservoir_index=int(i),
-                    reason='reservoir_release_interval',
+                    reason='reservoir_release_interval', feasibility_mode=feasibility_mode,
                     release_lower_m3s=float(low[row, i]),
                     release_upper_m3s=float(high[row, i]))
                     for row in np.flatnonzero(failed)])
@@ -107,5 +136,7 @@ def dispatch_release(storage, external, actions, storage_lower, storage_upper,
         release[:, i] = np.where(collapsed, midpoint,
                                  low[:, i]+executed[:, i]**2*(high[:, i]-low[:, i]))
     return dict(inflow=inflow, release=release, low=low, high=high,
-                controls=controls, actions=executed,
+                controls=controls, actions=executed, empty_interval=empty,
+                forced_interval=(controls == 0),
+                feasibility_mode=feasibility_mode,
                 physical_low_m3s=low.copy(), physical_high_m3s=high.copy())
