@@ -73,7 +73,8 @@ class PeriodicConstraintStatusTest(unittest.TestCase):
             episode_global_reward=value, episode_mixed_rewards=[value]*5,
             episode_local_rewards=[value]*5, energy_MWh=value, energy_TWh=value/1e6,
             episode_penalty_ecological_flow=0., violation_count=0,
-            max_daily_bound_excess_m3=0., service_shortfalls=shortfalls())
+            max_daily_bound_excess_m3=0., service_shortfalls=shortfalls(),
+            forced_actor_rate=0., infeasible_interval_rate=0.)
         row.update({name+'_end_m3':1e9-100. for name in ('WDD','BHT','XLD','XJB','THR')})
         return row
 
@@ -93,6 +94,16 @@ class PeriodicConstraintStatusTest(unittest.TestCase):
         self.assertEqual(row['evaluator_return'],20.)
         self.assertEqual(row['windows'][0]['storage_change_m3'],[-100.]*5)
         self.assertEqual(row['windows'][0]['total_storage_depletion_m3'],500.)
+        self.assertEqual(row['system_return'],20.)
+        self.assertEqual(row['hydropower_generation_TWh'],20./1e6)
+        self.assertEqual(row['ecological_violation_rate'],0.)
+        self.assertEqual(row['ecological_compliance_rate'],1.)
+        self.assertEqual(row['storage_change_m3'],[-100.]*5)
+        self.assertEqual(row['net_storage_change_m3'],-500.)
+        self.assertEqual(row['total_storage_depletion_billion_m3'],5e-7)
+        self.assertEqual(row['final_level_m'],[1e9-100.]*5)
+        self.assertEqual(row['forced_actor_rate'],0.)
+        self.assertEqual(row['infeasible_interval_rate'],0.)
         self.assertFalse(any(key.startswith('constraint_qualified_') for key in row))
 
     def test_partial_failure_never_averages_surviving_windows(self):
@@ -102,6 +113,14 @@ class PeriodicConstraintStatusTest(unittest.TestCase):
         self.assertFalse(row['physical_feasible'])
         self.assertFalse(row['required_constraints_met'])
         self.assertIsNone(row['evaluator_return'])
+        for metric in ('system_return','hydropower_generation_TWh','ecological_violation_rate',
+                       'ecological_compliance_rate','ecological_deficit_volume_m3',
+                       'storage_change_m3','net_storage_change_m3',
+                       'total_storage_depletion_billion_m3','final_level_m',
+                       'forced_actor_rate','infeasible_interval_rate'):
+            self.assertIsNone(row[metric], metric)
+        self.assertFalse(row['completed'])
+        self.assertEqual(row['windows'][1]['partial_storage_change_m3'],[0.]*5)
 
 
 if __name__ == '__main__':

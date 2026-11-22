@@ -1,4 +1,4 @@
-"""Five-year HAPPO training on 55 years with five held-out evaluation years."""
+"""Five-year cascade training on 55 years with five held-out evaluation years."""
 import argparse
 from pathlib import Path
 import sys
@@ -36,6 +36,8 @@ def load_configuration():
 def main(argv=None, *, experiment_runner=run_parallel_experiment,
          parser_extension=None, output_preflight=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--algorithm', choices=('happo', 'mappo'), default='happo',
+                        help='Policy to train; default: happo (five independent actors)')
     parser.add_argument('--data-dir',type=Path,default=ROOT/'data/cascade_reservoir_new')
     parser.add_argument('--episodes',type=int,help='Completed multi-year episodes per seed (default: 300)')
     parser.add_argument('--episode-days',type=int,help='Daily decisions per episode (default: 1825)')
@@ -207,7 +209,7 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
         if not args.skip_final_evaluation:
             for path in flatten_output_paths(daily_change_paths(
                     args.plot_output, args.episode_log, exp['seeds'],
-                    'happo')):
+                    args.algorithm)):
                 if path.exists():
                     parser.error('Daily-change diagnostic already exists: '+str(path))
         if not args.no_plot:
@@ -219,7 +221,13 @@ def main(argv=None, *, experiment_runner=run_parallel_experiment,
     exp['trajectory_diagnostics'] = args.trajectory_diagnostics
     exp['save_checkpoints'] = args.save_checkpoints
     exp['checkpoint_interval'] = args.checkpoint_interval
+    if getattr(args, 'algorithm', 'happo') == 'mappo':
+        config['algo']['share_param'] = True
     data = CascadeData(args.data_dir,physical,exp)
+    if getattr(args, 'algorithm', 'happo') != 'happo' and experiment_runner is run_parallel_experiment:
+        from harl.runners.cascade_mappo_runner import CascadeMAPPORunner
+        return run_parallel_experiment(data, physical, config, args,
+                                       runner_cls=CascadeMAPPORunner, algorithm_name=args.algorithm)
     return experiment_runner(data,physical,config,args)
 
 

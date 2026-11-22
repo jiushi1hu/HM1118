@@ -112,9 +112,10 @@ def _state_hash(state):
 def _critic_layout(metadata):
     """Validate value-head meaning separately from actor parameter sharing.
 
-    Earlier six-head files predate explicit layout metadata. Their five mixed
-    heads and final legacy head retain that interpretation, including historical
-    HAPPO files; they are never reinterpreted as the new scalar team critic.
+    Five-head mixed critics are shared by HAPPO mixed_gae and MAPPO. Earlier
+    six-head files predate explicit layout metadata. Their five mixed heads and
+    final legacy head retain that interpretation, including historical MAPPO
+    files; they are never reinterpreted as a five-head mixed critic.
     """
     dimension = metadata['critic_output_dim']
     if isinstance(dimension, (bool, np.bool_)) or not isinstance(dimension, (int, np.integer)):
@@ -133,7 +134,10 @@ def _critic_layout(metadata):
     if layout == 'shared_team':
         expected_dimension, expected_channels, algorithm = 1, (0,)*len(IDS), 'happo'
     elif layout == 'mixed_by_reservoir':
-        expected_dimension, expected_channels, algorithm = len(IDS), tuple(range(len(IDS))), 'happo'
+        expected_dimension, expected_channels = len(IDS), tuple(range(len(IDS)))
+        algorithm = metadata.get('algorithm_name', 'happo')
+        if algorithm not in ('happo', 'mappo'):
+            raise ValueError('Checkpoint algorithm disagrees with its critic reward layout')
     elif layout == 'mixed_by_reservoir_then_legacy_team':
         expected_dimension, expected_channels, algorithm = len(IDS)+1, tuple(range(len(IDS))), 'mappo'
     else:
@@ -171,9 +175,8 @@ def save_checkpoint(runner, path):
                 any(getattr(actor, 'core', None) is not core for actor in runner.actor)):
             raise ValueError('Shared MAPPO checkpoint requires five ordered views of one actor core')
         raw_dim = int(runner.envs[0].observation_space[0].shape[0])
-        actor_dim = raw_dim+len(IDS)
-        if tuple(core.obs_space.shape) != (actor_dim,):
-            raise ValueError('Shared actor input must append five agent identity features')
+        if tuple(core.obs_space.shape) != (raw_dim,):
+            raise ValueError('Shared actor input must equal the raw local observation dimension')
         actor_states = [_state_copy(first.actor)]
     else:
         actor_states = [_state_copy(actor.actor) for actor in runner.actor]
@@ -200,8 +203,9 @@ def save_checkpoint(runner, path):
         purpose='deterministic evaluation replay; training resume is not implemented',
         torch_version=str(torch.__version__), numpy_version=str(np.__version__)))
     if shared_actor:
-        metadata.update(actor_parameter_sharing=True, agent_ids=list(range(len(IDS))),
-                        actor_observation_dim=actor_dim, raw_actor_observation_dim=raw_dim)
+        metadata.update(actor_parameter_sharing=True,
+                        actor_identity_features='none',
+                        actor_observation_dim=raw_dim, raw_actor_observation_dim=raw_dim)
     credit_assignment = getattr(runner, 'credit_assignment', 'team_gae')
     if getattr(runner, 'algorithm_name', 'happo') == 'happo':
         metadata['happo_credit_assignment'] = credit_assignment
@@ -210,6 +214,9 @@ def save_checkpoint(runner, path):
             'mixed_gae': 'per_reservoir_mixed_gae',
             'counterfactual': 'one_step_counterfactual',
         }[credit_assignment]
+    else:
+        # MAPPO always trains on the five own mixed-return GAE channels.
+        metadata['actor_advantage_estimator'] = 'per_reservoir_mixed_gae'
     payload = dict(format=CHECKPOINT_FORMAT, version=CHECKPOINT_VERSION,
         metadata=metadata, metadata_sha256=_digest(metadata), actors=actor_states,
         critic=critic_state, value_normalizer=normalizer_state)
@@ -285,24 +292,34 @@ def load_checkpoint(path, data_root=None):
         credit_mode = args['algo'].get('happo_credit_assignment','team_gae')
         if credit_mode not in ('team_gae','mixed_gae','counterfactual'):
             raise ValueError('Checkpoint has unsupported actor credit assignment')
-        if metadata.get('happo_credit_assignment','team_gae') != credit_mode:
+        if metadata.get('algorithm_name') == 'happo' and \
+                metadata.get('happo_credit_assignment','team_gae') != credit_mode:
             raise ValueError('Checkpoint actor credit metadata disagrees with its settings')
         if credit_mode == 'counterfactual' and (
                 metadata.get('algorithm_name') != 'happo' or
                 metadata.get('actor_advantage_estimator') != 'one_step_counterfactual'):
             raise ValueError('Checkpoint counterfactual metadata is incomplete')
-        if credit_mode == 'mixed_gae' and (
-                metadata.get('algorithm_name') != 'happo' or
+        if metadata.get('algorithm_name') == 'happo' and credit_mode == 'mixed_gae' and (
                 metadata.get('critic_reward_layout') != 'mixed_by_reservoir' or
                 metadata.get('actor_advantage_estimator') != 'per_reservoir_mixed_gae'):
             raise ValueError('Checkpoint mixed_gae metadata is incomplete')
+        if metadata.get('algorithm_name') == 'mappo' and (
+                metadata.get('critic_reward_layout') == 'mixed_by_reservoir' and
+                metadata.get('actor_advantage_estimator') != 'per_reservoir_mixed_gae'):
+            raise ValueError('Checkpoint MAPPO mixed-return metadata is incomplete')
         configured_sharing = args['algo'].get('share_param', False)
         if not isinstance(configured_sharing, bool) or configured_sharing != shared_actor:
             raise ValueError('Checkpoint actor-sharing architecture disagrees with its settings')
         if shared_actor:
-            if (metadata.get('algorithm_name') != 'mappo' or
-                    metadata.get('agent_ids') != list(range(len(IDS)))):
-                raise ValueError('Shared checkpoint requires MAPPO and the five ordered agent IDs')
+            if metadata.get('algorithm_name') != 'mappo':
+                raise ValueError('Shared checkpoint requires MAPPO')
+            identity_features = metadata.get('actor_identity_features')
+            if identity_features is None:
+                # Historical six-head shared files stored the ordered agent IDs.
+                if metadata.get('agent_ids') != list(range(len(IDS))):
+                    raise ValueError('Legacy shared checkpoint requires the five ordered agent IDs')
+            elif identity_features != 'none' or 'agent_ids' in metadata:
+                raise ValueError('Current shared checkpoint must use raw local observations without agent IDs')
             if len(payload['actors']) != 1:
                 raise ValueError('Shared checkpoint requires one actor state')
         elif len(payload['actors']) != 5:
@@ -335,10 +352,20 @@ def load_checkpoint(path, data_root=None):
             raise ValueError('Checkpoint observation layout mismatch')
         if shared_actor:
             raw_dim = int(env.observation_space[0].shape[0])
-            actor_dim = raw_dim+len(IDS)
+            identity_features = metadata.get('actor_identity_features')
+            if identity_features is None:
+                # Historical shared checkpoints predate explicit identity metadata
+                # and appended a five-way one-hot reservoir vector.
+                actor_dim = raw_dim+len(IDS)
+                legacy_identity = True
+            elif identity_features == 'none':
+                actor_dim = raw_dim
+                legacy_identity = False
+            else:
+                raise ValueError('Checkpoint actor identity features must be none for the matched comparison')
             if (metadata.get('raw_actor_observation_dim') != raw_dim or
                     metadata.get('actor_observation_dim') != actor_dim):
-                raise ValueError('Shared checkpoint actor observation dimensions disagree with agent IDs')
+                raise ValueError('Shared checkpoint actor observation dimensions disagree with its identity layout')
         network_args = {**args['model'], **args['algo'], 'critic_output_dim': critic_output_dim}
         # Initializers consume RNG, so reconstruction must restore its caller's
         # state even on a malformed model state/load failure.
@@ -350,7 +377,9 @@ def load_checkpoint(path, data_root=None):
                     Box(-np.inf, np.inf, (actor_dim,), dtype=np.float32),
                     env.action_space[0], payload['actors'][0])
                 core.obs_space = Box(-np.inf, np.inf, (actor_dim,), dtype=np.float32)
-                actors = [SharedMAPPOAgent(core, i, num_agents=len(IDS)) for i in range(len(IDS))]
+                actors = [SharedMAPPOAgent(core, i, num_agents=len(IDS),
+                                           identity_features=legacy_identity)
+                          for i in range(len(IDS))]
             else:
                 actors = [_FrozenActor(network_args, env.observation_space[i], env.action_space[i], state)
                           for i, state in enumerate(payload['actors'])]

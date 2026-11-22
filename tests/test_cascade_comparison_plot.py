@@ -80,24 +80,21 @@ def payload():
 
 
 def use_current_learning_objectives(data):
-    """Declare the user-selected HAPPO-only team objective explicitly."""
+    """Declare the matched five-channel objective for both algorithms."""
     for entry in data['runs']:
-        team = entry['algorithm'] == 'happo'
         common_rows = entry['payload']['comparison_context']['shared_settings']['algo'].get(
             'normalize_shared_advantages', False)
         entry['payload']['learning_objective'] = dict(
-            advantage_source='shared_team' if team else 'individual_mixed',
-            reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
-                            if team else '0.5 * own local reward + 0.5 * global generation reward'),
-            critic_reward_layout='shared_team' if team else 'mixed_by_reservoir_then_legacy_team',
-            actor_value_channels=[0]*5 if team else list(range(5)),
-            normalization=('once_over_common_rollout_rows' if team
-                           else 'per_reservoir_over_common_rollout_rows' if common_rows
+            advantage_source='individual_mixed',
+            reward_formula='0.5 * own local reward + 0.5 * global generation reward',
+            critic_reward_layout='mixed_by_reservoir',
+            actor_value_channels=list(range(5)),
+            normalization=('per_reservoir_over_common_rollout_rows' if common_rows
                            else 'per_reservoir_over_controllable_rows'))
         entry['payload']['actor_architecture'] = dict(parameter_sharing=False,
             network_count=5, optimizer_count=5, raw_observation_dim=15,
             network_observation_dim=15, identity_features='implicit_in_separate_actor',
-            critic_output_dim=1 if team else 6)
+            critic_output_dim=5)
         for rows in entry['payload']['histories']:
             for row in rows:
                 row.update(episode_system_reward=2*row['episode_reward'],
@@ -115,13 +112,13 @@ class ComparisonFigureTest(unittest.TestCase):
     def tearDown(self):
         plt.close('all')
 
-    def test_current_objectives_are_labeled_without_changing_physical_metric_curves(self):
+    def test_matched_mixed_objectives_share_the_training_return_scale(self):
         figures = compare.make_figures(use_current_learning_objectives(payload()))
         for figure in figures.values():
-            self.assertIn('Different learning objectives', figure._suptitle.get_text())
-        np.testing.assert_allclose(figures['training'].axes[0].lines[0].get_ydata(), [7., 11.])
+            self.assertNotIn('Different learning objectives', figure._suptitle.get_text())
+        np.testing.assert_allclose(figures['training'].axes[0].lines[0].get_ydata(), [310.5, 316.5])
         np.testing.assert_allclose(figures['training'].axes[0].lines[1].get_ydata(), [310.5, 316.5])
-        np.testing.assert_allclose(figures['training'].axes[1].lines[0].get_ydata(), [16., 17.])
+        np.testing.assert_allclose(figures['training'].axes[1].lines[0].get_ydata(), [8., 9.])
         np.testing.assert_allclose(figures['violations'].axes[0].lines[1].get_ydata(), [15., 15., 15.])
 
     def test_joint_figures_keep_seeds_within_algorithm(self):
@@ -222,8 +219,8 @@ class ComparisonIdentityTest(unittest.TestCase):
             run['actor_architecture'].update(parameter_sharing=shared,
                 network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
                 raw_observation_dim=raw_dim,
-                network_observation_dim=raw_dim+5 if shared else raw_dim,
-                identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor',
+                network_observation_dim=raw_dim,
+                identity_features='none' if shared else 'implicit_in_separate_actor',
                 actor_observation_layout=compare.CASCADE_ACTOR_OBSERVATION_LAYOUT,
                 critic_state_layout=compare.CASCADE_CRITIC_STATE_LAYOUT,
                 critic_state_size=110)
@@ -318,14 +315,14 @@ class ComparisonIdentityTest(unittest.TestCase):
                     run['actor_architecture'].update(parameter_sharing=shared,
                         network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
                         raw_observation_dim=raw_dim,
-                        network_observation_dim=raw_dim+5 if shared else raw_dim,
-                        identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor')
+                        network_observation_dim=raw_dim,
+                        identity_features='none' if shared else 'implicit_in_separate_actor')
                 compare.validate_comparison(data)
                 data['runs'][1]['payload']['actor_architecture']['network_observation_dim'] -= 1
                 with self.assertRaisesRegex(ValueError, 'dimensions/counts'):
                     compare.validate_comparison(data)
 
-    def test_team_objective_requires_scalar_happo_value_and_single_global_term(self):
+    def test_matched_objective_requires_five_mixed_heads_for_both_algorithms(self):
         data = use_current_learning_objectives(payload())
         compare.validate_comparison(data)
         for flag in (False, True):
@@ -336,11 +333,12 @@ class ComparisonIdentityTest(unittest.TestCase):
             use_current_learning_objectives(changed)
             compare.validate_comparison(changed)
             self.assertEqual(changed['runs'][0]['payload']['learning_objective']['normalization'],
-                             'once_over_common_rollout_rows')
+                             'per_reservoir_over_common_rollout_rows' if flag else
+                             'per_reservoir_over_controllable_rows')
             self.assertEqual(changed['runs'][1]['payload']['learning_objective']['normalization'],
                              'per_reservoir_over_common_rollout_rows' if flag else
                              'per_reservoir_over_controllable_rows')
-        for field, value in (('actor_value_channels', list(range(5))),
+        for field, value in (('actor_value_channels', [0]*5),
                              ('reward_formula', 'sum(mixed rewards)'),
                              ('normalization', 'per_actor_controllable_rows')):
             changed = copy.deepcopy(data)
@@ -357,8 +355,8 @@ class ComparisonIdentityTest(unittest.TestCase):
         happo['comparison_context']['shared_settings']['algo']['share_param'] = False
         mappo['comparison_context']['shared_settings']['algo']['share_param'] = True
         mappo['actor_architecture'] = dict(parameter_sharing=True, network_count=1,
-            optimizer_count=1, raw_observation_dim=15, network_observation_dim=20,
-            identity_features='one_hot_reservoir_id', critic_output_dim=6)
+            optimizer_count=1, raw_observation_dim=15, network_observation_dim=15,
+            identity_features='none', critic_output_dim=5)
         compare.validate_comparison(data)
         self.assertTrue(mappo['comparison_context']['shared_settings']['algo']['share_param'])
         altered = copy.deepcopy(data)
@@ -366,7 +364,7 @@ class ComparisonIdentityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'settings'):
             compare.validate_comparison(altered)
         altered = copy.deepcopy(data)
-        altered['runs'][1]['payload']['actor_architecture']['network_observation_dim'] = 15
+        altered['runs'][1]['payload']['actor_architecture']['network_observation_dim'] = 20
         with self.assertRaisesRegex(ValueError, 'architecture'):
             compare.validate_comparison(altered)
         happo['actor_architecture'] = dict(mappo['actor_architecture'])

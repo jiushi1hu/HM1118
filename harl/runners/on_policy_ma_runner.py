@@ -14,9 +14,10 @@ class OnPolicyMARunner(OnPolicyBaseRunner):
                 self.critic_buffer.value_preds[:-1])
         else:
             advantages = self.critic_buffer.returns[:-1] - self.critic_buffer.value_preds[:-1]
-        if advantages.shape[-1] not in (1, self.num_agents + 1):
-            raise ValueError('Expected one legacy return or one mixed return per actor plus a legacy return')
-        if self.algo_args['algo'].get('normalize_shared_advantages', False):
+        if advantages.shape[-1] not in (1, self.num_agents):
+            raise ValueError('Expected one legacy return or one mixed return per actor')
+        if (self.algo_args['algo'].get('normalize_shared_advantages', False) and
+                advantages.shape[-1] > 1):
             advantages = ((advantages - advantages.mean(axis=(0, 1), keepdims=True)) /
                           (advantages.std(axis=(0, 1), keepdims=True) + 1e-5))
 

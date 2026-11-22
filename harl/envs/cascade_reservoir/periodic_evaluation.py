@@ -8,7 +8,9 @@ import torch
 
 from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.episodes import positive_integer, training_windows
-from harl.envs.cascade_reservoir.evaluation import evaluate_policy, episode_constraint_status
+from harl.envs.cascade_reservoir.evaluation import (
+    STANDARDIZED_EVALUATION_FIELDS, evaluate_policy, episode_constraint_status,
+    standardized_evaluation_metrics)
 from harl.envs.cascade_reservoir.storage_accounting import storage_change_summary
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.reward import REWARD_AGGREGATION, validate_discount_factor
@@ -17,9 +19,15 @@ from harl.envs.cascade_reservoir.reward import REWARD_AGGREGATION, validate_disc
 PERIODIC_EVALUATION_DAYS = 1825
 _SCALAR_METRICS = ('evaluator_return', 'generation_MWh', 'generation_TWh',
                    'ecological_flow_penalty',
-                   'system_evaluator_return', 'global_evaluator_return')
+                   'system_evaluator_return', 'global_evaluator_return',
+                   'system_return', 'hydropower_generation_TWh',
+                   'ecological_violation_rate', 'ecological_compliance_rate',
+                   'ecological_deficit_volume_m3', 'net_storage_change_m3',
+                   'total_storage_depletion_billion_m3',
+                   'forced_actor_rate', 'infeasible_interval_rate')
 _VECTOR_METRICS = ('final_storage_m3', 'final_level_m',
-                   'mixed_evaluator_returns', 'local_evaluator_returns')
+                   'mixed_evaluator_returns', 'local_evaluator_returns',
+                   'storage_change_m3')
 _VIOLATION_TERMS = ('ecological_flow',)
 _VIOLATION_METRICS = tuple(term+suffix for term in _VIOLATION_TERMS
     for suffix in ('_violation_rate', '_violation_count', '_active_reservoir_days'))
@@ -183,7 +191,15 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
                                _SCALAR_METRICS+_VECTOR_METRICS+_VIOLATION_METRICS})
                 result['service_shortfalls'] = None
                 result.update(storage_change_summary(window['initial_storage_m3'],
-                    progress.get('partial_storage_m3', window['initial_storage_m3'])))
+                    progress.get('partial_storage_m3', window['initial_storage_m3']),
+                    prefix='partial_'))
+                result['storage_change_m3'] = None
+                result['net_storage_change_m3'] = None
+                result['total_storage_depletion_billion_m3'] = None
+                result.update(standardized_evaluation_metrics(
+                    system_return=None, generation_TWh=None, violation_count=None,
+                    active_reservoir_days=None, ecological_deficit_volume_m3=None,
+                    storage_change_m3=result['storage_change_m3'], final_level_m=None))
                 result.update(episode_constraint_status(completed=False, physical_feasible=False))
             else:
                 final_storage = [measured[name+'_end_m3'] for name in IDS]
@@ -202,6 +218,17 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
                     service_shortfalls=measured['service_shortfalls'])
                 result.update(storage_change_summary(window['initial_storage_m3'], final_storage))
                 result.update(_violation_metrics(measured['service_shortfalls']))
+                shortfalls = measured['service_shortfalls']['ecological_flow']
+                result.update(standardized_evaluation_metrics(
+                    system_return=measured['episode_system_reward'],
+                    generation_TWh=measured['energy_TWh'],
+                    violation_count=shortfalls['reservoir_day_count'],
+                    active_reservoir_days=shortfalls['active_reservoir_days'],
+                    ecological_deficit_volume_m3=shortfalls['deficit_volume_m3'],
+                    storage_change_m3=result['storage_change_m3'],
+                    final_level_m=data.levels(final_storage).tolist(),
+                    forced_actor_rate=measured['forced_actor_rate'],
+                    infeasible_interval_rate=measured['infeasible_interval_rate']))
                 result.update(episode_constraint_status(completed=True, physical_feasible=True,
                     service_shortfalls=measured['service_shortfalls']))
             individual.append(result)
@@ -231,10 +258,15 @@ def evaluate_periodic_policy(actors, data, physical_config, *, seed, evaluation_
     for metric in _SCALAR_METRICS+_VECTOR_METRICS:
         record[metric] = (np.asarray([row[metric] for row in individual], dtype=np.float64).mean(axis=0).tolist()
                           if successes == 3 else None)
+    record['standardized_metrics'] = list(STANDARDIZED_EVALUATION_FIELDS)
+    record['standardized_metric_role'] = ('policy evaluation only; identical definitions and inputs for '
+        'HAPPO and MAPPO; never used as actor rewards or GAE targets')
     record.update(feasible=record['physical_feasible'],
         feasible_definition='physical-only alias of physical_feasible')
     for metric in ('initial_storage_m3', 'storage_change_m3', 'net_storage_change_m3',
-                   'total_storage_depletion_m3', 'total_storage_depletion_billion_m3'):
+                   'total_storage_depletion_m3', 'total_storage_depletion_billion_m3',
+                   'partial_storage_change_m3', 'partial_net_storage_change_m3',
+                   'partial_total_storage_depletion_billion_m3'):
         record[metric] = (np.asarray([row[metric] for row in individual], dtype=np.float64).mean(axis=0).tolist()
                           if successes == 3 else None)
     record['storage_aggregation'] = 'arithmetic mean over all fixed scenarios; null when any scenario is incomplete'

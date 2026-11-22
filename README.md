@@ -30,8 +30,9 @@ python -B examples/train_cascade_compare.py \
 ```
 
 The default comparison runs both algorithms; select `--algorithms happo` or
-`--algorithms mappo` to run one. `examples/train_cascade.py` remains the HAPPO
-entry point. The episode budget applies separately to each algorithm and seed.
+`--algorithms mappo` to run one. `examples/train_cascade.py` defaults to HAPPO
+and selects MAPPO with `--algorithm mappo`. The episode budget applies
+separately to each algorithm and seed.
 `--no-plot` disables the legacy training/comparison figures and plot windows.
 Automatic daily level/release diagnostics are still saved when `--episode-log`
 provides a run directory. `--plot-python PATH` selects another interpreter with
@@ -174,22 +175,22 @@ The default therefore performs 50 updates per seed. Leap days remain in the data
 the fixed horizon need not end on December 31.
 
 HAPPO uses five independent actors and one centralized critic. The default
-`team_gae` mode trains on `system_reward` with one value output; all actors share
-one team GAE advantage, normalized once across rollout rows. The `mixed_gae` mode
-trains on each reservoir's `mixed_rewards[i]` with five critic value outputs and
-five independently computed GAE channels; each actor receives only its own
-channel. Both modes update actors sequentially with accumulated likelihood
+`mixed_gae` mode trains on each reservoir's `mixed_rewards[i]` with five critic
+value outputs and five independently computed GAE channels; each actor receives
+only its own channel. Actors update sequentially with accumulated likelihood
 corrections for previously updated actors and PPO clipping of the current actor
 ratio. Control masks zero forced rows, and losses retain a mean over the entire
-rollout.
+rollout. `team_gae` remains available as an explicitly selected HAPPO option.
 
-MAPPO uses one shared actor and optimizer. Five lightweight views append a
-five-way one-hot reservoir identity, giving 27 actor network inputs.
-Own mixed-return advantages are pooled in one joint training batch. One
-centralized critic produces five mixed-return values plus a legacy accounting
-value. MAPPO uses unit factors and no sequential likelihood correction. Its
-sharing, reward targets and critic layout differ from HAPPO, so comparisons do
-not isolate a single algorithmic difference.
+MAPPO uses one shared actor and optimizer. Every reservoir passes the same
+22-feature local observation to that actor; no reservoir-ID one-hot is appended.
+Own mixed-return advantages are pooled in one joint training batch. The
+centralized critic has exactly five mixed-return outputs and no legacy value
+channel. MAPPO uses unit factors and no sequential likelihood correction. The
+matched comparison therefore holds the actor observation, mixed-reward targets,
+five-output critic, gamma, GAE lambda, data, sampler, optimization settings and
+evaluation sequence fixed; parameter sharing and the HAPPO sequential update
+remain the intended algorithmic differences.
 
 Actor and critic MLPs use hidden widths `[64, 128, 256, 256]`, ReLU, hidden
 LayerNorm, categorical action distributions, Adam and gradient clipping. GAE and
@@ -197,12 +198,14 @@ actor advantages use rollout ValueNorm statistics. The normalizer updates once
 from full-rollout critic targets after actor training and stays fixed through
 critic epochs. Training uses CPU execution.
 
-`--happo-credit-assignment mixed_gae` selects the five-channel mixed-return mode.
+`--happo-credit-assignment team_gae` selects the one-channel HAPPO team-return
+mode. `--happo-credit-assignment mixed_gae` selects the matched five-channel
+mixed-return mode and is the default.
 `--happo-credit-assignment counterfactual` optionally replaces HAPPO actor GAE
 with frozen one-step, model-assisted counterfactual credit. It enumerates commands
 under the same full physical constraints and ecological reward, holding other
 commands fixed. The scalar team critic retains its GAE targets and sequential
-HAPPO corrections remain. Default credit assignment is `team_gae`.
+HAPPO corrections remain.
 
 ## Sampling, evaluation and plots
 
@@ -218,6 +221,15 @@ Final held-out evaluation uses an ordered representative-year sequence and the
 same episode horizon. Physical infeasibility is reported explicitly; failed
 windows remain failures, with no completed aggregate substituted from survivors.
 
+Both algorithms emit the same standardized evaluation block
+(`STANDARDIZED_EVALUATION_FIELDS`): system return,
+`hydropower_generation_TWh`, ecological violation and compliance rates,
+ecological deficit volume, signed per-reservoir and net `storage_change_m3`,
+depletion, `final_level_m`, forced-actor rate and infeasible-interval rate.
+These fields describe policy performance; they are never substituted into actor
+rewards or GAE targets. Completed evaluations also carry the initial, final and
+change storage trajectory.
+
 Three standard plot artifacts are available: stochastic training return/generation,
 fixed-scenario evaluator return, and a single-panel ecological-flow violation
 rate. Means and sample standard deviations stay separate by algorithm. Violation
@@ -225,10 +237,10 @@ rates count violating active reservoir-days, independent of reward weights and
 gamma. Ecological deficit volumes and generation are undiscounted; reported
 returns retain gamma. Failed or missing evaluations leave gaps.
 
-Return plots follow the recorded learning objective: HAPPO uses shared-system
-returns (including counterfactual-credit HAPPO), while MAPPO uses the mean of
-its five individual mixed returns. Comparison legends identify these different
-objectives. Saved-log plots reconstruct training returns from all completed
+Return plots follow the recorded learning objective. The matched default uses
+the mean of five individual mixed returns for both HAPPO and MAPPO; explicitly
+selected `team_gae` HAPPO uses shared-system returns. Saved-log plots
+reconstruct training returns from all completed
 episode summaries in each update. Older logs without objective metadata retain
 explicitly labeled legacy-team returns; declared learning objectives with missing
 return data are rejected instead of substituting legacy accounting rewards.

@@ -32,13 +32,13 @@ def windows():
 
 
 def objective(algorithm, counterfactual=False):
-    team = algorithm == 'happo'
+    team = algorithm == 'happo' and counterfactual
     return dict(
         advantage_source=('counterfactual_shared_team' if counterfactual else
-                          'shared_team' if team else 'individual_mixed'),
+                          'individual_mixed'),
         reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
                         if team else '0.5 * own local reward + 0.5 * global generation reward'),
-        critic_reward_layout='shared_team' if team else 'mixed_by_reservoir_then_legacy_team',
+        critic_reward_layout='shared_team' if team else 'mixed_by_reservoir',
         actor_value_channels=[0]*5 if team else list(range(5)),
         normalization=('common_controllable_rms_without_centering' if counterfactual else
                        'once_over_common_rollout_rows' if team else
@@ -93,8 +93,8 @@ class LearningReturnFigureTest(unittest.TestCase):
     def tearDown(self):
         plt.close('all')
 
-    def test_happo_and_counterfactual_plot_system_returns(self):
-        for counterfactual in (False, True):
+    def test_counterfactual_happo_plots_system_returns(self):
+        for counterfactual in (True,):
             with self.subTest(counterfactual=counterfactual):
                 payload = run('happo', counterfactual)
                 before = copy.deepcopy(payload)
@@ -107,14 +107,16 @@ class LearningReturnFigureTest(unittest.TestCase):
                 np.testing.assert_allclose(training.axes[1].lines[0].get_ydata(), [16., 17.])
                 self.assertEqual(payload, before)
 
-    def test_mappo_plots_mean_of_five_mixed_returns(self):
-        payload = run('mappo')
-        training = parallel.make_figure(payload)
-        evaluator = parallel.make_evaluator_figure(payload)
-        np.testing.assert_allclose(training.axes[0].lines[0].get_ydata(), [8., 9.])
-        np.testing.assert_allclose(evaluator.axes[0].lines[0].get_ydata(), [4.5, 5.5, 6.5])
-        self.assertIn('mixed', training.axes[0].get_ylabel().lower())
-        self.assertIn('mixed', evaluator.axes[0].get_ylabel().lower())
+    def test_matched_happo_and_mappo_plot_mean_of_five_mixed_returns(self):
+        for algorithm in ('happo', 'mappo'):
+            with self.subTest(algorithm=algorithm):
+                payload = run(algorithm)
+                training = parallel.make_figure(payload)
+                evaluator = parallel.make_evaluator_figure(payload)
+                np.testing.assert_allclose(training.axes[0].lines[0].get_ydata(), [8., 9.])
+                np.testing.assert_allclose(evaluator.axes[0].lines[0].get_ydata(), [4.5, 5.5, 6.5])
+                self.assertIn('mixed', training.axes[0].get_ylabel().lower())
+                self.assertIn('mixed', evaluator.axes[0].get_ylabel().lower())
 
     def test_mappo_scalar_components_reconstruct_mean_mixed_in_memory(self):
         payload = run('mappo')
@@ -145,16 +147,15 @@ class LearningReturnFigureTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parallel.make_evaluator_figure(payload)
 
-    def test_comparison_lines_keep_distinct_learning_objectives(self):
+    def test_comparison_lines_share_the_matched_learning_objective(self):
         figures = compare.make_figures(dict(schema=compare.SCHEMA, runs=[
             dict(algorithm=name, payload=run(name)) for name in ('happo', 'mappo')]))
         training, evaluator = figures['training'].axes[0], figures['evaluator'].axes[0]
-        np.testing.assert_allclose(training.lines[0].get_ydata(), [16., 17.])
+        np.testing.assert_allclose(training.lines[0].get_ydata(), [8., 9.])
         np.testing.assert_allclose(training.lines[1].get_ydata(), [8., 9.])
-        np.testing.assert_allclose(evaluator.lines[0].get_ydata(), [115., 116., 117.])
+        np.testing.assert_allclose(evaluator.lines[0].get_ydata(), [4.5, 5.5, 6.5])
         np.testing.assert_allclose(evaluator.lines[1].get_ydata(), [4.5, 5.5, 6.5])
         labels = ' '.join(training.get_legend_handles_labels()[1]).lower()
-        self.assertIn('system', labels)
         self.assertIn('mixed', labels)
         np.testing.assert_allclose(figures['violations'].axes[0].lines[0].get_ydata(), [15.]*3)
 
@@ -205,7 +206,7 @@ def log_rows(algorithm):
         episode_horizon_days=2, parallel_environments=2, updates_per_seed=2,
         config=dict(algo={'gamma': 1.}, experiment={'seeds': [1]}),
         learning_objective=payload['learning_objective'],
-        actor_architecture={'critic_output_dim': 1 if algorithm == 'happo' else 6},
+        actor_architecture={'critic_output_dim': 1 if algorithm == 'happo' else 5},
         periodic_evaluation={'windows': windows()}, training_years=settings['training_years'],
         evaluation_source_years=settings['evaluation_source_years'])
     episodes = [dict(record_type='training_episode', seed=1, episode=lane+1,

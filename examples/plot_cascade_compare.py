@@ -179,7 +179,7 @@ def _observation_dimensions(run):
 
 
 def _validate_architecture(algorithm, run):
-    """Accept legacy independent actors or explicit ID-conditioned shared MAPPO."""
+    """Accept legacy independent actors or the matched shared MAPPO actor."""
     settings = run['comparison_context']['shared_settings']
     requested = settings.get('algo', {}).get('share_param')
     if requested is not None and not isinstance(requested, bool):
@@ -188,15 +188,14 @@ def _validate_architecture(algorithm, run):
         raise ValueError('HAPPO comparison requires independent actor parameters')
     architecture = run.get('actor_architecture')
     objective = run.get('learning_objective')
-    critic_dim = 6  # Historical runs used individual mixed values plus legacy.
+    critic_dim = 5
     if objective is not None:
         if not isinstance(objective, dict):
             raise ValueError('learning_objective must be a mapping')
         counterfactual = (algorithm == 'happo' and
             settings.get('algo', {}).get('happo_credit_assignment','team_gae') == 'counterfactual')
         team = algorithm == 'happo' and objective.get('advantage_source') in ('shared_team','counterfactual_shared_team')
-        mixed_happo = (algorithm == 'happo' and
-                       objective.get('critic_reward_layout') == 'mixed_by_reservoir')
+        mixed_layout = objective.get('critic_reward_layout') == 'mixed_by_reservoir'
         objective_layout = ('shared_team' if team else
             'mixed_by_reservoir' if objective.get('critic_reward_layout') == 'mixed_by_reservoir' else
             'mixed_by_reservoir_then_legacy_team')
@@ -209,11 +208,14 @@ def _validate_architecture(algorithm, run):
             normalization=('common_controllable_rms_without_centering' if counterfactual else
                            'once_over_common_rollout_rows' if team
                            else 'per_reservoir_over_common_rollout_rows'
-                           if mixed_happo or settings.get('algo', {}).get('normalize_shared_advantages', False)
+                           if mixed_layout or settings.get('algo', {}).get('normalize_shared_advantages', False)
                            else 'per_reservoir_over_controllable_rows'))
         if objective != expected_objective:
             raise ValueError('Learning objective does not match the algorithm reward/value layout')
-        critic_dim = 1 if team else 5 if objective.get('critic_reward_layout') == 'mixed_by_reservoir' else 6
+        if objective.get('critic_reward_layout') == 'mixed_by_reservoir_then_legacy_team':
+            critic_dim = 6  # Historical runs used five mixed values plus a legacy head.
+        else:
+            critic_dim = 1 if team else 5
     if architecture is None:
         if requested:
             raise ValueError('Shared MAPPO requires explicit actor_architecture metadata')
@@ -222,14 +224,21 @@ def _validate_architecture(algorithm, run):
         raise ValueError('actor_architecture must be a mapping')
     shared = architecture.get('parameter_sharing')
     if not isinstance(shared, bool) or (algorithm == 'happo' and shared):
-        raise ValueError('Only MAPPO may use an ID-conditioned shared actor')
+        raise ValueError('Only MAPPO may use a shared actor')
     if requested is not None and requested != shared:
         raise ValueError('Actor architecture disagrees with share_param')
     raw_dim, _ = _observation_dimensions(run)
+    identity = architecture.get('identity_features')
+    legacy_identity = shared and identity == 'one_hot_reservoir_id'
+    if shared and identity not in ('none', 'one_hot_reservoir_id'):
+        raise ValueError('Shared MAPPO actor identity features must be none for the matched comparison')
     expected = dict(network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
-        raw_observation_dim=raw_dim, network_observation_dim=raw_dim+5 if shared else raw_dim,
-        identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor',
+        raw_observation_dim=raw_dim,
+        network_observation_dim=raw_dim+5 if legacy_identity else raw_dim,
+        identity_features=identity if shared else 'implicit_in_separate_actor',
         critic_output_dim=critic_dim)
+    if legacy_identity and objective is not None and objective.get('critic_reward_layout') != 'mixed_by_reservoir_then_legacy_team':
+        raise ValueError('Agent-ID actor inputs are only supported for historical six-head runs')
     if any(architecture.get(key) != value for key, value in expected.items()):
         raise ValueError('Actor architecture dimensions/counts do not match the cascade observations')
 

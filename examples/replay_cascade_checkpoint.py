@@ -14,7 +14,7 @@ from harl.envs.cascade_reservoir.checkpoint import load_checkpoint, ReplayTraceW
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True,
-                        help='Trusted local evaluation checkpoint produced by train_cascade.py')
+                        help='Trusted HAPPO or MAPPO evaluation checkpoint from train_cascade.py')
     parser.add_argument('--source-years', nargs='+', type=int, required=True,
                         help='Ordered source years containing the requested replay horizon')
     parser.add_argument('--episode-days', type=int,

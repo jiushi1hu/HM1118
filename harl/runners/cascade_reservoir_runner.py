@@ -84,8 +84,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                                          'counterfactual_batch_size')
         if self.credit_assignment == 'counterfactual' and self.algorithm_name != 'happo':
             raise ValueError('Counterfactual credit is an opt-in HAPPO variant; MAPPO requires team_gae')
-        if self.credit_assignment == 'mixed_gae' and self.algorithm_name != 'happo':
-            raise ValueError('mixed_gae is a HAPPO-only advantage mode')
+        if self.credit_assignment not in ('team_gae', 'mixed_gae', 'counterfactual'):
+            raise ValueError('Unsupported cascade credit assignment')
         self.counterfactual_credit = self.counterfactual_advantages = None
         self.counterfactual_context = self.counterfactual_probabilities = None
         self.counterfactual_log = counterfactual_log
@@ -136,9 +136,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         torch.use_deterministic_algorithms(True)
         self.reward_settings = reward_settings(physical_config)
-        # HAPPO team_gae uses one team-return value. HAPPO mixed_gae uses five
-        # reservoir-specific mixed-return values; MAPPO retains its six heads.
-        if self.credit_assignment == 'mixed_gae':
+        # HAPPO team_gae uses one team-return value. HAPPO mixed_gae and MAPPO
+        # share five reservoir-specific mixed-return heads with no legacy channel.
+        if self.credit_assignment == 'mixed_gae' or self.algorithm_name == 'mappo':
             self.critic_reward_layout = 'mixed_by_reservoir'
             self.actor_value_channels = tuple(range(self.num_agents))
         if self.critic_reward_layout == 'shared_team':
@@ -249,8 +249,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         """Describe the actual policy target alongside preserved accounting fields."""
         team = self.critic_reward_layout == 'shared_team'
         common_rows = self.algo_args['algo'].get('normalize_shared_advantages', False)
-        happo_mixed = (self.algorithm_name == 'happo' and
-                       self.critic_reward_layout == 'mixed_by_reservoir')
+        mixed_layout = self.critic_reward_layout == 'mixed_by_reservoir'
         metadata = dict(algorithm=self.algorithm_name,
             critic_reward_layout=self.critic_reward_layout,
             actor_value_channels=list(self.actor_value_channels),
@@ -259,7 +258,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                   ['mixed_rewards[{}]'.format(i) for i in self.actor_value_channels]),
             advantage_estimator='gae' if self.algo_args['algo'].get('use_gae', True) else 'discounted_return',
             advantage_normalization=('once_over_common_rollout_rows' if team else
-                'per_reservoir_over_common_rollout_rows' if happo_mixed or common_rows else
+                'per_reservoir_over_common_rollout_rows' if mixed_layout or common_rows else
                 'per_reservoir_over_controllable_rows'),
             actor_reward_definition=SYSTEM_REWARD_DEFINITION if team else ACTOR_REWARD_DEFINITION,
             mixed_reward_definition=ACTOR_REWARD_DEFINITION)

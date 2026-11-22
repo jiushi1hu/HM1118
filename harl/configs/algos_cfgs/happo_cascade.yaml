@@ -25,10 +25,11 @@ model:
   action_distribution: categorical
   action_bins: 100
 algo:
-  # team_gae: shared system-reward GAE and one critic value.
-  # mixed_gae: per-reservoir mixed-reward GAE and five critic values.
+  # mixed_gae: per-reservoir mixed-reward GAE and five critic values. This is
+  # the shared HAPPO/MAPPO comparison objective.
+  # team_gae: shared system-reward GAE and one critic value (HAPPO option).
   # counterfactual: model-assisted one-step actor credit; critic keeps team GAE.
-  happo_credit_assignment: team_gae
+  happo_credit_assignment: mixed_gae
   counterfactual_batch_size: 4096  # Maximum physics/critic candidate batch
   gamma: 0.995  # Discount for GAE, critic returns and return accounting; actor rows have no extra time weight.
   gae_lambda: 0.95
@@ -49,7 +50,7 @@ algo:
   use_policy_active_masks: true
   action_aggregation: prod
   entropy_coef: 0.001
-  normalize_shared_advantages: true  # MAPPO toggles per-reservoir common-row normalization; HAPPO mixed_gae always uses common rows; team_gae normalizes once.
+  normalize_shared_advantages: true  # HAPPO mixed_gae and MAPPO normalize each reservoir over common rollout rows; team_gae normalizes once.
   mask_inactive_factors: true
 experiment:
   collection_mode: five_year_parallel

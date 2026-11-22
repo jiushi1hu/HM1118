@@ -23,8 +23,7 @@ if str(ROOT) not in sys.path:
 from harl.algorithms.actors.happo import HAPPO
 from harl.algorithms.actors.mappo import MAPPO
 from harl.algorithms.actors.shared_mappo import (
-    SharedMAPPOAgent, augment_agent_observations, joint_shared_actor_batch,
-    make_shared_mappo_agents)
+    SharedMAPPOAgent, joint_shared_actor_batch, make_shared_mappo_agents)
 from harl.common.buffers.on_policy_actor_buffer import OnPolicyActorBuffer
 from harl.common.buffers.on_policy_critic_buffer_ep import OnPolicyCriticBufferEP
 from harl.envs.cascade_reservoir.data_loader import CascadeData
@@ -371,13 +370,12 @@ class SharedMAPPOObjectiveTest(unittest.TestCase):
             advantages.append(advantage.copy())
         return buffers, advantages
 
-    def test_one_core_optimizer_and_identity_inputs_without_extra_initializers(self):
+    def test_one_core_optimizer_and_raw_inputs_without_extra_initializers(self):
         views = self.views()
         after_factory = torch.get_rng_state().clone()
         torch.manual_seed(21)
         reference = MAPPO(dict(self.args, share_param=True),
-            Box(np.r_[self.obs_space.low, np.zeros(5)].astype(np.float32),
-                np.r_[self.obs_space.high, np.ones(5)].astype(np.float32), dtype=np.float32),
+            Box(self.obs_space.low, self.obs_space.high, dtype=np.float32),
             self.act_space)
         self.assertTrue(torch.equal(after_factory, torch.get_rng_state()))
         self.assert_state_equal(views[0].actor.state_dict(), reference.actor.state_dict())
@@ -388,29 +386,21 @@ class SharedMAPPOObjectiveTest(unittest.TestCase):
         for i, view in enumerate(views):
             self.assertIs(view.core, view.shared_core)
             self.assertEqual(view.obs_space.shape, (2,))
-            augmented = augment_agent_observations(obs, i)
-            np.testing.assert_array_equal(augmented[:, :2], obs)
-            np.testing.assert_array_equal(augmented[:, 2:], np.eye(5, dtype=np.float32)[[i, i]])
             with torch.no_grad():
-                expected = reference.get_actions(augmented, deterministic=True)
+                expected = reference.get_actions(obs, deterministic=True)
                 actual = view.get_actions(obs, deterministic=True)
             for left, right in zip(expected, actual):
                 torch.testing.assert_close(left, right, rtol=0., atol=0.)
+            with self.assertRaisesRegex(ValueError, 'raw local observations'):
+                view.get_actions(np.zeros((2, 7), dtype=np.float32), deterministic=True)
         np.testing.assert_array_equal(obs, saved)
         views[2].actor_num_mini_batch = 2
         self.assertEqual(views[0].core.actor_num_mini_batch, 2)
         with self.assertRaisesRegex(ValueError, 'share_param_train'):
             views[0].train(None, None, 'EP')
 
-    def test_identity_helper_supports_tensor_batches_and_frozen_views(self):
+    def test_frozen_view_accepts_the_same_raw_observation(self):
         views = self.views()
-        obs = torch.ones((2, 3, 2), requires_grad=True)
-        augmented = augment_agent_observations(obs, 3)
-        self.assertEqual(tuple(augmented.shape), (2, 3, 7))
-        augmented.sum().backward()
-        torch.testing.assert_close(obs.grad, torch.ones_like(obs))
-        with self.assertRaises(ValueError):
-            augment_agent_observations(obs, 5)
         # Frozen replay needs neither an optimizer nor training actor methods.
         core = views[0].core
         frozen = SimpleNamespace(args=core.args, actor=core.actor, obs_space=core.obs_space)
@@ -434,11 +424,9 @@ class SharedMAPPOObjectiveTest(unittest.TestCase):
             advantages[i] += np.float32(i)
         snapshots = [copy.deepcopy(buffer.__dict__) for buffer in buffers]
         joint, joined = joint_shared_actor_batch(views[0].core, buffers, advantages, 5)
-        self.assertEqual(joint.obs.shape, (5, 5, 7))
+        self.assertEqual(joint.obs.shape, (5, 5, 2))
         for i, buffer in enumerate(buffers):
-            np.testing.assert_array_equal(joint.obs[:, i, :2], buffer.obs[:, 0])
-            np.testing.assert_array_equal(joint.obs[:, i, 2:],
-                np.broadcast_to(np.eye(5, dtype=np.float32)[i], (5, 5)))
+            np.testing.assert_array_equal(joint.obs[:, i], buffer.obs[:, 0])
             np.testing.assert_array_equal(joined[:, i], advantages[i][:, 0])
             np.testing.assert_array_equal(joint.action_log_probs[:, i], buffer.action_log_probs[:, 0])
             np.testing.assert_array_equal(joint.active_masks[:, i], buffer.active_masks[:, 0])
@@ -575,7 +563,7 @@ class CascadeMAPPOIntegrationTest(unittest.TestCase):
         cls.data = CascadeData(ROOT/'data/cascade_reservoir_new', cls.physical, cls.args['experiment'])
         cls.windows = select_periodic_windows(cls.data, episode_days=4)
 
-    def test_shared_actor_identity_inputs_and_repeatable_initialization(self):
+    def test_shared_actor_raw_inputs_and_repeatable_initialization(self):
         happo = CascadeReservoirRunner(self.data, self.physical, self.args, 1,
                                         periodic_windows=self.windows)
         self.addCleanup(happo.close)
@@ -594,9 +582,9 @@ class CascadeMAPPOIntegrationTest(unittest.TestCase):
             self.assertIsInstance(ma, SharedMAPPOAgent)
             self.assertIs(ma.shared_core, mappo.actor[0].shared_core)
             self.assertEqual(ma.obs_space.shape, happo.actor[0].obs_space.shape)
-            self.assertEqual(ma.core.obs_space.shape[0], ma.obs_space.shape[0]+5)
             self.assertEqual(ma.obs_space.shape, (22,))
-            self.assertEqual(ma.core.obs_space.shape, (27,))
+            self.assertEqual(ma.core.obs_space.shape, (22,))
+            self.assertFalse(ma.identity_features)
         self.assertTrue(all(buffer.obs.shape[-1] == 22 for buffer in mappo.actor_buffer))
         first_critic = next(layer for layer in mappo.critic.critic.modules()
                             if isinstance(layer, torch.nn.Linear))
@@ -606,7 +594,7 @@ class CascadeMAPPOIntegrationTest(unittest.TestCase):
             self.assertTrue(torch.equal(value, repeat.actor[0].actor.state_dict()[name]))
         for name, value in mappo.critic.critic.state_dict().items():
             self.assertTrue(torch.equal(value, repeat.critic.critic.state_dict()[name]))
-        self.assertEqual(mappo.critic_output_dim, 6)
+        self.assertEqual(mappo.critic_output_dim, 5)
 
     def test_tiny_real_update_diagnostics_checkpoint_and_replay(self):
         from harl.envs.cascade_reservoir.checkpoint import load_checkpoint

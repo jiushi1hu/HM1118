@@ -1,4 +1,9 @@
-"""Identity-conditioned views and joint rollout batches for shared MAPPO."""
+"""Shared-policy views and joint rollout batches for cascade MAPPO.
+
+The shared actor consumes the same 22-feature local observation as each HAPPO
+actor. Reservoir identity is carried only by view order; it is never appended
+to the network input, so both algorithms see an identical observation vector.
+"""
 import numpy as np
 import torch
 from gym.spaces import Box
@@ -16,43 +21,28 @@ def _identity(agent_id, num_agents):
     return int(agent_id), int(num_agents)
 
 
-def augment_agent_observations(obs, agent_id, num_agents=5):
-    """Append a fixed one-hot reservoir identity, preserving leading batch axes."""
-    agent_id, num_agents = _identity(agent_id, num_agents)
-    if isinstance(obs, torch.Tensor):
-        if obs.ndim < 1:
-            raise ValueError('Agent observations require a feature axis')
-        values = obs if obs.is_floating_point() else obs.to(dtype=torch.float32)
-        identity = torch.zeros((*values.shape[:-1], num_agents),
-                               dtype=values.dtype, device=values.device)
-        identity[..., agent_id] = 1.
-        return torch.cat((values, identity), dim=-1)
-    values = np.asarray(obs)
-    if values.ndim < 1:
-        raise ValueError('Agent observations require a feature axis')
-    if not np.issubdtype(values.dtype, np.floating):
-        values = values.astype(np.float32)
-    identity = np.zeros((*values.shape[:-1], num_agents), dtype=values.dtype)
-    identity[..., agent_id] = 1.
-    return np.concatenate((values, identity), axis=-1)
-
-
 class SharedMAPPOAgent:
     """One reservoir's local-observation view of a single shared policy.
 
     The core owns the only actor and optimizer. Physical buffers and the
-    environment retain their raw observation layout. This view also supports
-    a frozen inference core exposing only args, actor and augmented obs_space.
+    environment retain their raw observation layout. Views differ only in the
+    reservoir whose rollout they expose; the network input is identical to
+    the independent HAPPO actor input.
     """
 
-    def __init__(self, core, agent_id, num_agents=5):
+    def __init__(self, core, agent_id, num_agents=5, identity_features=False):
         self.agent_id, self.num_agents = _identity(agent_id, num_agents)
+        if not isinstance(identity_features, (bool, np.bool_)):
+            raise ValueError('identity_features must be a boolean')
+        self.identity_features = bool(identity_features)
         self.core = core
         self.shared_core = core
         shape = core.obs_space.shape
-        if len(shape) != 1 or shape[0] <= self.num_agents:
-            raise ValueError('Shared MAPPO core observations must include raw features and agent identity')
-        raw_size = shape[0]-self.num_agents
+        if len(shape) != 1 or shape[0] < 1:
+            raise ValueError('Shared MAPPO core observations must be a nonempty vector')
+        if self.identity_features and shape[0] <= self.num_agents:
+            raise ValueError('Legacy identity-conditioned cores need agent identity features')
+        raw_size = shape[0]-self.num_agents if self.identity_features else shape[0]
         self.obs_space = Box(np.asarray(core.obs_space.low[:raw_size], dtype=np.float32),
                              np.asarray(core.obs_space.high[:raw_size], dtype=np.float32),
                              dtype=np.float32)
@@ -78,10 +68,26 @@ class SharedMAPPOAgent:
         return getattr(core, name)
 
     def _observations(self, obs):
+        """Reject identity-augmented inputs so the 22-feature contract holds.
+
+        Only historical identity-conditioned checkpoints set identity_features.
+        Current training and comparison always use the raw local vector.
+        """
         shape = obs.shape if hasattr(obs, 'shape') else np.shape(obs)
         if not shape or shape[-1] != self.obs_space.shape[0]:
-            raise ValueError('Shared MAPPO views require raw local observations')
-        return augment_agent_observations(obs, self.agent_id, self.num_agents)
+            raise ValueError('Shared MAPPO views require raw local observations of shape '
+                             +str(self.obs_space.shape))
+        if self.identity_features:
+            if isinstance(obs, torch.Tensor):
+                identity = torch.zeros((*obs.shape[:-1], self.num_agents),
+                                       dtype=obs.dtype, device=obs.device)
+                identity[..., self.agent_id] = 1.
+                return torch.cat((obs, identity), dim=-1)
+            values = np.asarray(obs)
+            identity = np.zeros((*values.shape[:-1], self.num_agents), dtype=values.dtype)
+            identity[..., self.agent_id] = 1.
+            return np.concatenate((values, identity), axis=-1)
+        return obs
 
     def get_actions(self, obs, available_actions=None, deterministic=False):
         return self.actor(self._observations(obs), available_actions, deterministic)
@@ -116,7 +122,7 @@ class SharedMAPPOAgent:
 
 
 def make_shared_mappo_agents(args, obs_spaces, act_spaces, device=torch.device('cpu')):
-    """Construct exactly one identity-conditioned core and five lightweight views."""
+    """Construct exactly one core policy and five indistinguishable views."""
     from harl.algorithms.actors.mappo import MAPPO
     num_agents = len(obs_spaces)
     if num_agents != 5 or len(act_spaces) != num_agents:
@@ -127,10 +133,9 @@ def make_shared_mappo_agents(args, obs_spaces, act_spaces, device=torch.device('
     if any(space.__class__.__name__ != 'Discrete' or space.n != act_spaces[0].n
            for space in act_spaces):
         raise ValueError('Shared MAPPO requires equal categorical action spaces')
-    low = np.r_[obs_spaces[0].low, np.zeros(num_agents)].astype(np.float32)
-    high = np.r_[obs_spaces[0].high, np.ones(num_agents)].astype(np.float32)
-    augmented_space = Box(low, high, dtype=np.float32)
-    core = MAPPO(dict(args, share_param=True), augmented_space, act_spaces[0], device)
+    raw_space = Box(np.asarray(obs_spaces[0].low, dtype=np.float32),
+                    np.asarray(obs_spaces[0].high, dtype=np.float32), dtype=np.float32)
+    core = MAPPO(dict(args, share_param=True), raw_space, act_spaces[0], device)
     return [SharedMAPPOAgent(core, i, num_agents) for i in range(num_agents)]
 
 
@@ -143,7 +148,7 @@ def joint_shared_actor_batch(core, buffers, own_advantages, num_agents):
     if not buffers:
         raise ValueError('Shared MAPPO requires nonempty actor buffers')
     days, lanes = buffers[0].episode_length, buffers[0].n_rollout_threads
-    raw_size = core.obs_space.shape[0]-num_agents
+    raw_size = core.obs_space.shape[0]
     normalized = []
     for buffer, advantages in zip(buffers, own_advantages):
         if (buffer.episode_length != days or buffer.n_rollout_threads != lanes or
@@ -164,8 +169,7 @@ def joint_shared_actor_batch(core, buffers, own_advantages, num_agents):
 
     joint = OnPolicyActorBuffer(dict(episode_length=days, n_rollout_threads=lanes*num_agents),
                                 core.obs_space, core.act_space)
-    joint.obs = np.concatenate([augment_agent_observations(buffer.obs, i, num_agents)
-                                for i, buffer in enumerate(buffers)], axis=1)
+    joint.obs = np.concatenate([buffer.obs for buffer in buffers], axis=1)
     for name in ('actions', 'action_log_probs', 'masks', 'active_masks'):
         setattr(joint, name, np.concatenate([getattr(buffer, name) for buffer in buffers], axis=1))
     available = [buffer.available_actions for buffer in buffers]

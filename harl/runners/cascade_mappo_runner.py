@@ -8,12 +8,12 @@ from harl.runners.on_policy_ma_runner import OnPolicyMARunner
 
 
 class CascadeMAPPORunner(CascadeReservoirRunner):
-    """One ID-conditioned actor shared by five reservoirs and one value model."""
+    """One actor shared by five reservoirs and one five-output mixed critic."""
 
     actor_class = MAPPO
     algorithm_name = 'mappo'
     share_actor_parameters = True
-    critic_reward_layout = 'mixed_by_reservoir_then_legacy_team'
+    critic_reward_layout = 'mixed_by_reservoir'
     actor_value_channels = (0, 1, 2, 3, 4)
 
     def __init__(self, data, physical_config, algo_args, seed, *args, **kwargs):

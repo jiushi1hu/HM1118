@@ -13,6 +13,64 @@ from harl.envs.cascade_reservoir.feasibility_ablation import (
     FeasibilityRecorder, level_trajectory_summary)
 
 
+STANDARDIZED_EVALUATION_FIELDS = (
+    'system_return', 'hydropower_generation_TWh', 'ecological_violation_rate',
+    'ecological_compliance_rate', 'ecological_deficit_volume_m3',
+    'storage_change_m3', 'net_storage_change_m3',
+    'total_storage_depletion_billion_m3', 'final_level_m',
+    'forced_actor_rate', 'infeasible_interval_rate')
+
+
+def standardized_evaluation_metrics(*, system_return, generation_TWh, violation_count,
+        active_reservoir_days, ecological_deficit_volume_m3, storage_change_m3,
+        final_level_m, forced_actor_rate=None, infeasible_interval_rate=None):
+    """Return the common HAPPO/MAPPO evaluation metric block.
+
+    These are policy-performance measurements, not learning rewards. Ecological
+    performance is the fraction of active reservoir-days with a positive flow
+    shortfall. Storage change is signed final minus initial inventory.
+    """
+    count = None if violation_count is None else int(violation_count)
+    active = None if active_reservoir_days is None else int(active_reservoir_days)
+    if count is not None and active is not None:
+        if count < 0 or active < 0 or count > active:
+            raise ValueError('Ecological violation counts must satisfy 0 <= count <= active reservoir-days')
+        rate = count/active if active else None
+        compliance = 1.-rate if rate is not None else None
+    else:
+        rate = compliance = None
+    change = None if storage_change_m3 is None else np.asarray(storage_change_m3, dtype=np.float64)
+    if change is not None and (change.shape != (len(IDS),) or not np.isfinite(change).all()):
+        raise ValueError('Standardized storage change must be a finite five-vector')
+    levels = None if final_level_m is None else np.asarray(final_level_m, dtype=np.float64)
+    if levels is not None and (levels.shape != (len(IDS),) or not np.isfinite(levels).all()):
+        raise ValueError('Standardized final level must be a finite five-vector')
+    return dict(
+        system_return=None if system_return is None else float(system_return),
+        hydropower_generation_TWh=None if generation_TWh is None else float(generation_TWh),
+        ecological_violation_rate=rate,
+        ecological_compliance_rate=compliance,
+        ecological_deficit_volume_m3=(None if ecological_deficit_volume_m3 is None
+                                      else float(ecological_deficit_volume_m3)),
+        storage_change_m3=None if change is None else change.tolist(),
+        net_storage_change_m3=None if change is None else float(change.sum()),
+        total_storage_depletion_billion_m3=None if change is None else float(-change.sum()/1e9),
+        final_level_m=None if levels is None else levels.tolist(),
+        forced_actor_rate=None if forced_actor_rate is None else float(forced_actor_rate),
+        infeasible_interval_rate=(None if infeasible_interval_rate is None
+                                  else float(infeasible_interval_rate)),
+        units=dict(system_return='discounted episode system reward in reward units',
+                   hydropower_generation_TWh='terawatt-hours over the complete episode',
+                   ecological_violation_rate='violating active reservoir-days / active reservoir-days',
+                   ecological_compliance_rate='1 - ecological_violation_rate',
+                   ecological_deficit_volume_m3='summed daily flow shortfall over the five reservoirs',
+                   storage_change_m3='final minus initial reservoir inventory',
+                   net_storage_change_m3='sum of the five signed storage changes',
+                   total_storage_depletion_billion_m3='negative net storage change in billion m3',
+                   final_level_m='end-of-episode water level per reservoir',
+                   forced_actor_rate='forced reservoir-days / all reservoir-days',
+                   infeasible_interval_rate='refused release intervals / decision days'))
+
 def episode_constraint_status(*, completed, physical_feasible, service_shortfalls=None):
     """Report completed physical operation separately from soft ecological service."""
     ecology = None
@@ -176,6 +234,19 @@ def evaluate_policy(actors, data, physical_config, seed, episode, training_steps
     result['level_trajectory'] = level_trajectory_summary([feasibility])
     result.update(episode_constraint_status(completed=True, physical_feasible=True,
         service_shortfalls=result['service_shortfalls']))
+    shortfalls = result['service_shortfalls']['ecological_flow']
+    result.update(standardized_evaluation_metrics(
+        system_return=result['episode_system_reward'],
+        generation_TWh=result['energy_TWh'],
+        violation_count=shortfalls['reservoir_day_count'],
+        active_reservoir_days=shortfalls['active_reservoir_days'],
+        ecological_deficit_volume_m3=shortfalls['deficit_volume_m3'],
+        storage_change_m3=result['storage_change_m3'],
+        final_level_m=data.levels(env.storage).tolist(),
+        forced_actor_rate=result['forced_actor_rate'],
+        infeasible_interval_rate=result['infeasible_interval_rate']))
+    result['storage_trajectory'] = dict(initial_m3=initial.tolist(),
+        final_m3=env.storage.tolist(), change_m3=result['storage_change_m3'])
     if diagnostics:
         result.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
             spill_by_reservoir_billion_m3=(spill_by_reservoir/1e9).tolist(),

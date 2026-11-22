@@ -45,10 +45,10 @@ def comparison_options(**changes):
 
 
 def assert_learning_provenance(case, record, algorithm, common_rows=True):
-    team = algorithm == 'happo'
+    team = algorithm == 'happo' and record.get('critic_reward_layout') == 'shared_team'
     case.assertEqual(record['algorithm'], algorithm)
     case.assertEqual(record['critic_reward_layout'],
-        'shared_team' if team else 'mixed_by_reservoir_then_legacy_team')
+        'shared_team' if team else 'mixed_by_reservoir')
     case.assertEqual(record['actor_value_channels'], [0]*5 if team else list(range(5)))
     case.assertEqual(record['advantage_source'], 'shared_team' if team else 'individual_mixed')
     case.assertEqual(record['actor_reward_sources'], ['system_reward']*5 if team else
@@ -362,12 +362,12 @@ class ShortComparisonIntegrationTest(unittest.TestCase):
         self.assertTrue(all(view.core is core for view in runner.actor))
         self.assertTrue(all(view.actor is core.actor for view in runner.actor))
         self.assertTrue(all(view.actor_optimizer is core.actor_optimizer for view in runner.actor))
-        self.assertEqual(core.obs_space.shape, (27,))
+        self.assertEqual(core.obs_space.shape, (22,))
         self.assertTrue(all(buffer.obs.shape[-1] == 22 for buffer in runner.actor_buffer))
         self.assertEqual(runner.envs[0].observation_space[0].shape, (22,))
         self.assertEqual(runner.critic_buffer.share_obs.shape[-1], 110)
-        self.assertEqual(runner.critic_output_dim, 6)
-        self.assertEqual(runner.critic_reward_layout, 'mixed_by_reservoir_then_legacy_team')
+        self.assertEqual(runner.critic_output_dim, 5)
+        self.assertEqual(runner.critic_reward_layout, 'mixed_by_reservoir')
         self.assertEqual(runner.actor_value_channels, (0, 1, 2, 3, 4))
         self.assertTrue(runner.algo_args['algo']['share_param'])
         self.assertEqual(runner.requested_args, config_before)
@@ -408,9 +408,9 @@ class ShortComparisonIntegrationTest(unittest.TestCase):
         train_critic.assert_called_once_with(runner.critic_buffer, runner.value_normalizer,
                                             update_normalizer_once=True)
         update_norm.assert_called_once()
-        self.assertEqual(update_norm.call_args.args[0].shape, (8, 6))
+        self.assertEqual(update_norm.call_args.args[0].shape, (8, 5))
         np.testing.assert_array_equal(update_norm.call_args.args[0],
-                                      runner.critic_buffer.returns[:-1].reshape(8, 6))
+                                      runner.critic_buffer.returns[:-1].reshape(8, 5))
         self.assertEqual(optimize.call_count, 10)
         self.assertTrue(all(call.kwargs['update_normalizer'] is False for call in optimize.call_args_list))
         self.assertTrue(normalization_states)
@@ -529,8 +529,8 @@ class HAPPOSharedTeamAdvantageTest(unittest.TestCase):
         runner.num_agents = 5
         runner.algo_args = dict(train=dict(episode_length=2, n_rollout_threads=1))
         runner.value_normalizer = None
-        runner.critic_buffer = SimpleNamespace(returns=np.zeros((3, 1, 6)),
-                                               value_preds=np.zeros((3, 1, 6)))
+        runner.critic_buffer = SimpleNamespace(returns=np.zeros((3, 1, 5)),
+                                               value_preds=np.zeros((3, 1, 5)))
         with self.assertRaisesRegex(ValueError, 'one shared-team'):
             runner.train()
 
@@ -554,7 +554,7 @@ class HAPPOSharedTeamAdvantageTest(unittest.TestCase):
         own = mappo._critic_rewards([transition])
         np.testing.assert_array_equal(team, np.asarray([[expected_team]], dtype=np.float32))
         np.testing.assert_array_equal(own,
-            np.asarray([np.r_[transition['mixed_rewards'], transition['reward']]], dtype=np.float32))
+            np.asarray([transition['mixed_rewards']], dtype=np.float32))
         for key in ('power', 'release', 'local_rewards', 'mixed_rewards'):
             np.testing.assert_array_equal(transition[key], saved[key])
         self.assertEqual(transition['reward'], saved['reward'])
@@ -669,11 +669,11 @@ class SharedMAPPOTrainingDispatchTest(unittest.TestCase):
         runner.num_agents = 5
         runner.algo_args = dict(algo=dict(share_param=True, normalize_shared_advantages=True))
         runner.diagnostics_enabled = True
-        raw = np.arange(48, dtype=np.float32).reshape(4, 2, 6)
+        raw = np.arange(40, dtype=np.float32).reshape(4, 2, 5)
         runner.critic_buffer = SimpleNamespace(returns=raw**2, value_preds=raw/7.)
-        runner.value_normalizer = ValueNorm(6, beta=.5)
+        runner.value_normalizer = ValueNorm(5, beta=.5)
         runner.value_normalizer.update(np.array([[-3.], [1.], [4.]], dtype=np.float32)*
-            np.arange(1, 7, dtype=np.float32)+np.array([0., 8., -4., 20., -12., 32.], dtype=np.float32))
+            np.arange(1, 6, dtype=np.float32)+np.array([0., 8., -4., 20., -12.], dtype=np.float32))
         old_statistics = copy.deepcopy(runner.value_normalizer.state_dict())
 
         class Buffer:
@@ -712,7 +712,7 @@ class SharedMAPPOTrainingDispatchTest(unittest.TestCase):
             self.assertTrue(update_normalizer_once)
             self.assertEqual(calls, ['actor'])
             calls.append('critic')
-            normalizer.update(buffer.returns[:-1].reshape(-1, 6))
+            normalizer.update(buffer.returns[:-1].reshape(-1, 5))
             return {'value_loss': 0.}
 
         runner.critic = SimpleNamespace(train=mock.Mock(side_effect=critic_train))

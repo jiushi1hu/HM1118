@@ -474,8 +474,6 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         raise ValueError('happo_credit_assignment must be team_gae, mixed_gae or counterfactual')
     if credit_mode == 'counterfactual' and getattr(runner_cls,'algorithm_name','happo') != 'happo':
         raise ValueError('Counterfactual credit is a HAPPO-only variant')
-    if credit_mode == 'mixed_gae' and getattr(runner_cls,'algorithm_name','happo') != 'happo':
-        raise ValueError('mixed_gae is a HAPPO-only advantage mode')
     trajectory_enabled=config['experiment'].get('trajectory_diagnostics',False)
     checkpoints_enabled=config['experiment'].get('save_checkpoints',False)
     if not isinstance(trajectory_enabled,bool) or not isinstance(checkpoints_enabled,bool):
@@ -527,9 +525,9 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     shared_algo.pop('share_param',None)
     sharing=bool(getattr(runner_cls,'share_actor_parameters',False))
     critic_layout = ('mixed_by_reservoir' if credit_mode == 'mixed_gae' else
-                     getattr(runner_cls,'critic_reward_layout','mixed_by_reservoir_then_legacy_team'))
+                     getattr(runner_cls,'critic_reward_layout','shared_team'))
     team_advantage=critic_layout=='shared_team'
-    mixed_happo = critic_layout=='mixed_by_reservoir'
+    mixed_layout = critic_layout=='mixed_by_reservoir'
     learning_objective=dict(
         advantage_source='shared_team' if team_advantage else 'individual_mixed',
         reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
@@ -538,15 +536,15 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         actor_value_channels=[0]*5 if team_advantage else list(range(5)),
         normalization=('once_over_common_rollout_rows' if team_advantage
                        else 'per_reservoir_over_common_rollout_rows'
-                       if mixed_happo or config['algo'].get('normalize_shared_advantages',False)
+                       if mixed_layout or config['algo'].get('normalize_shared_advantages',False)
                        else 'per_reservoir_over_controllable_rows'))
     daily_limits=physical.get('use_daily_level_limits',True)
     raw_observation_dim=len(actor_observation_features(daily_limits))
     actor_architecture=dict(parameter_sharing=sharing,network_count=1 if sharing else 5,
         optimizer_count=1 if sharing else 5,raw_observation_dim=raw_observation_dim,
-        network_observation_dim=raw_observation_dim+(5 if sharing else 0),
-        identity_features='one_hot_reservoir_id' if sharing else 'implicit_in_separate_actor',
-        critic_output_dim=1 if team_advantage else 5 if mixed_happo else 6,
+        network_observation_dim=raw_observation_dim,
+        identity_features='none' if sharing else 'implicit_in_separate_actor',
+        critic_output_dim=1 if team_advantage else 5,
         actor_observation_layout=ACTOR_OBSERVATION_LAYOUT,
         critic_state_layout=CRITIC_STATE_LAYOUT,
         critic_state_size=critic_state_size(daily_limits))
@@ -570,8 +568,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
                 'ecological-flow costs are disabled when reward penalties are disabled',
             system_reward='0.5 * sum(local rewards) + 0.5 * global generation reward',
             critic=('one centralized scalar team-return output' if team_advantage else
-                    'one centralized network: five mixed-return outputs' if mixed_happo else
-                    'one centralized network: five mixed-return outputs plus one legacy-team diagnostic output'),
+                    'one centralized network: five mixed-return outputs'),
             actor_advantages=('shared team GAE, normalized once over common rollout rows' if team_advantage else
                               'own mixed-return GAE and own value output; normalize each channel over common rollout rows'),
             actor_temporal_weighting='uniform_rollout_rows',
@@ -718,8 +715,8 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         metadata['algorithm']=algorithm_name
     if algorithm_name=='mappo':
         metadata['learning_reward_architecture']['update_interpretation']=(
-            'one shared actor trained on pooled reservoir samples and individual mixed-return '
-            'clipped PPO surrogates with a centralized critic; '
+            'one shared actor without agent-ID inputs trained on pooled reservoir samples and '
+            'individual mixed-return clipped PPO surrogates with a five-output centralized critic; '
             'system reward remains an accounting metric rather than the actor training target')
     if verbose_console:
         print(json.dumps(metadata,indent=2,allow_nan=False),flush=True)

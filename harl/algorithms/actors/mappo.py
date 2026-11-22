@@ -182,8 +182,8 @@ class MAPPO(OnPolicyBase):
 
         The five physical buffers remain unchanged. Their own mixed-return
         advantages, masks and old probabilities retain the same row alignment
-        after identity features are appended and agent lanes are concatenated.
-        There is one optimizer step per joint minibatch and epoch.
+        after the raw observation lanes are concatenated. There is one
+        optimizer step per joint minibatch and epoch.
         """
         from harl.algorithms.actors.shared_mappo import joint_shared_actor_batch
         if state_type != 'EP':

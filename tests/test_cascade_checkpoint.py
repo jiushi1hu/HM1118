@@ -344,15 +344,16 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
         cls.args = copy.deepcopy(cls.args)
         cls.args['algo']['share_param'] = True
 
-    def test_one_state_one_frozen_network_and_five_identity_views(self):
+    def test_one_state_one_frozen_network_and_five_raw_observation_views(self):
         save_checkpoint(self.runner, self.path)
         stored = self.payload()
         self.assertEqual(len(stored['actors']), 1)
         self.assertEqual(len(stored['metadata']['model_hashes']['actors']), 1)
         self.assertTrue(stored['metadata']['actor_parameter_sharing'])
-        self.assertEqual(stored['metadata']['agent_ids'], list(range(5)))
+        self.assertEqual(stored['metadata']['actor_identity_features'], 'none')
+        self.assertNotIn('agent_ids', stored['metadata'])
         self.assertEqual(stored['metadata']['raw_actor_observation_dim'], 22)
-        self.assertEqual(stored['metadata']['actor_observation_dim'], 27)
+        self.assertEqual(stored['metadata']['actor_observation_dim'], 22)
         before = torch.get_rng_state().clone()
         numpy_before, random_before = np.random.get_state(), random.getstate()
         frozen = load_checkpoint(self.path)
@@ -365,7 +366,7 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
         self.assertFalse(hasattr(frozen.actors[0].core, 'actor_optimizer'))
         first_linear = next(module for module in frozen.actors[0].actor.modules()
                             if isinstance(module, torch.nn.Linear))
-        self.assertEqual(first_linear.in_features, 27)
+        self.assertEqual(first_linear.in_features, 22)
         observation = self.runner.envs[0].actor_observations()[0:1]
         for original, view in zip(self.runner.actor, frozen.actors):
             with torch.no_grad():
@@ -376,13 +377,13 @@ class SharedCascadeCheckpointTest(CascadeCheckpointTest):
     def test_shared_architecture_metadata_is_validated(self):
         save_checkpoint(self.runner, self.path)
         original = self.payload()
-        for change in ('ids', 'input', 'states'):
+        for change in ('identity', 'input', 'states'):
             with self.subTest(change=change):
                 stored = copy.deepcopy(original)
-                if change == 'ids':
-                    stored['metadata']['agent_ids'] = [0, 0, 2, 3, 4]
+                if change == 'identity':
+                    stored['metadata']['agent_ids'] = list(range(5))
                 elif change == 'input':
-                    stored['metadata']['actor_observation_dim'] = 22
+                    stored['metadata']['actor_observation_dim'] = 27
                 else:
                     stored['actors'] = stored['actors']*5
                     stored['metadata']['model_hashes']['actors'] *= 5

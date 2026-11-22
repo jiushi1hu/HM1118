@@ -1,7 +1,7 @@
 """Run matched HAPPO/MAPPO experiments and display three comparison figures.
 
-The existing train_cascade.py entry point remains HAPPO-only. This entry point
-reuses its configuration and validation, and defaults to both algorithms.
+This entry point reuses train_cascade.py's configuration and validation,
+runs fresh models and optimizers for each algorithm, and defaults to both.
 """
 import copy
 import json
@@ -61,8 +61,9 @@ def comparison_preflight(args, config):
     counterfactual = config['algo'].get('happo_credit_assignment','team_gae') == 'counterfactual'
     if counterfactual and 'mappo' in algorithms:
         raise ValueError('Counterfactual credit is a HAPPO-only variant; select --algorithms happo')
-    if 'happo' in algorithms and config['algo'].get('share_param', False):
-        raise ValueError('HAPPO retains five independent actors; its share_param must be false')
+    credit = config['algo'].get('happo_credit_assignment', 'team_gae')
+    if 'happo' in algorithms and credit not in ('team_gae', 'mixed_gae'):
+        raise ValueError('The HAPPO comparison requires team_gae or mixed_gae credit')
     paths = [] if args.episode_log is None else [Path(args.episode_log)]
     seeds = config['experiment']['seeds']
     explicit_daily_directory = (None if getattr(args, 'plot_output', None) is None
@@ -109,8 +110,9 @@ def run_comparison(data, physical, config, args):
         print('Running {} with the shared cascade configuration ...'.format(
               algorithm.upper()), flush=True)
         effective_config = copy.deepcopy(config)
-        if algorithm == 'mappo':
-            effective_config['algo']['share_param'] = True
+        # Sharing is the architectural difference: HAPPO keeps five independent
+        # actors, while MAPPO always runs its one shared actor.
+        effective_config['algo']['share_param'] = algorithm == 'mappo'
         payload = run_parallel_experiment(data, copy.deepcopy(physical),
             effective_config, options, runner_cls=RUNNERS[algorithm],
             algorithm_name=algorithm)
